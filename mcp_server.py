@@ -22,8 +22,6 @@ load_dotenv()
 
 INTERNAL_LOGIN_PATH = "/internal/login"
 ICON_PATH = "/icon.png"
-FAVICON_PATH = "/favicon.ico"
-PUBLIC_PATHS = {ICON_PATH, FAVICON_PATH}
 
 _public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
 _icons = [Icon(src=f"https://{_public_domain}{ICON_PATH}", mime_type="image/png")] if _public_domain else None
@@ -78,15 +76,6 @@ async def icon(request: Request) -> FileResponse:
     return FileResponse(os.path.join(os.path.dirname(__file__), "static", "icon.png"))
 
 
-@mcp.custom_route(FAVICON_PATH, methods=["GET"])
-async def favicon(request: Request) -> FileResponse:
-    """Mismo icono servido en la ruta estándar de favicon, por si algún cliente
-    (o un futuro dominio propio) lo descubre así en vez de vía ICON_PATH."""
-    return FileResponse(
-        os.path.join(os.path.dirname(__file__), "static", "icon.png"), media_type="image/png"
-    )
-
-
 @mcp.custom_route(INTERNAL_LOGIN_PATH, methods=["POST"])
 async def internal_login(request: Request) -> JSONResponse:
     """Cambia la cuenta de Garmin activa: hace un login real con las credenciales
@@ -132,10 +121,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
     """Rechaza cualquier petición que no traiga la clave compartida correcta: los
     clientes MCP normales (cabecera Authorization o ?apiKey=) usan MCP_AUTH_TOKEN;
     la web de conexión, al llamar a INTERNAL_LOGIN_PATH, usa INTERNAL_LOGIN_TOKEN.
-    ICON_PATH y FAVICON_PATH son públicos (se piden sin credenciales)."""
+    ICON_PATH es público (los clientes MCP lo piden sin credenciales)."""
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in PUBLIC_PATHS:
+        if request.url.path == ICON_PATH:
             return await call_next(request)
 
         expected = (
