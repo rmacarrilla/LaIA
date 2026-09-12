@@ -11,22 +11,17 @@ from garminconnect import (
 )
 from garminconnect.client import token_file_path
 from mcp.server.mcpserver import MCPServer
-from mcp.types import Icon
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import JSONResponse
 
 from garmin_client import get_client
 
 load_dotenv()
 
+mcp = MCPServer("garmin-activities")
+
 INTERNAL_LOGIN_PATH = "/internal/login"
-ICON_PATH = "/icon.png"
-
-_public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-_icons = [Icon(src=f"https://{_public_domain}{ICON_PATH}", mime_type="image/png")] if _public_domain else None
-
-mcp = MCPServer("garmin-activities", icons=_icons)
 
 
 @mcp.tool()
@@ -67,13 +62,6 @@ def get_activity_detail(activity_id: int) -> dict:
         "average_speed_mps": summary.get("averageSpeed"),
         "elevation_gain_meters": summary.get("elevationGain"),
     }
-
-
-@mcp.custom_route(ICON_PATH, methods=["GET"])
-async def icon(request: Request) -> FileResponse:
-    """Icono del conector, público y sin autenticación (lo piden los clientes MCP
-    directamente por HTTP al mostrar el conector, sin apiKey)."""
-    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "icon.png"))
 
 
 @mcp.custom_route(INTERNAL_LOGIN_PATH, methods=["POST"])
@@ -120,13 +108,9 @@ async def internal_login(request: Request) -> JSONResponse:
 class BearerTokenMiddleware(BaseHTTPMiddleware):
     """Rechaza cualquier petición que no traiga la clave compartida correcta: los
     clientes MCP normales (cabecera Authorization o ?apiKey=) usan MCP_AUTH_TOKEN;
-    la web de conexión, al llamar a INTERNAL_LOGIN_PATH, usa INTERNAL_LOGIN_TOKEN.
-    ICON_PATH es público (los clientes MCP lo piden sin credenciales)."""
+    la web de conexión, al llamar a INTERNAL_LOGIN_PATH, usa INTERNAL_LOGIN_TOKEN."""
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == ICON_PATH:
-            return await call_next(request)
-
         expected = (
             os.environ["INTERNAL_LOGIN_TOKEN"]
             if request.url.path == INTERNAL_LOGIN_PATH
@@ -146,7 +130,7 @@ if __name__ == "__main__":
         import uvicorn
         from mcp.server.transport_security import TransportSecuritySettings
 
-        public_domain = _public_domain
+        public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
         transport_security = (
             TransportSecuritySettings(
                 allowed_hosts=[public_domain],
