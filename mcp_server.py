@@ -21,9 +21,36 @@ def list_activities(limit: int = 5) -> list[dict]:
     assert isinstance(activities, list)
 
     return [
-        {"date": activity["startTimeLocal"], "name": activity["activityName"]}
+        {
+            "activity_id": activity["activityId"],
+            "date": activity["startTimeLocal"],
+            "name": activity["activityName"],
+        }
         for activity in activities
     ]
+
+
+@mcp.tool()
+def get_activity_detail(activity_id: int) -> dict:
+    """Devuelve el detalle de una actividad de Garmin Connect (duración, distancia,
+    calorías, frecuencia cardíaca, velocidad media y desnivel). El activity_id se
+    obtiene de list_activities."""
+    client = get_client()
+    activity = client.get_activity(str(activity_id))
+    summary = activity["summaryDTO"]
+
+    return {
+        "name": activity["activityName"],
+        "type": activity["activityTypeDTO"]["typeKey"],
+        "date": summary["startTimeLocal"],
+        "duration_seconds": summary.get("duration"),
+        "distance_meters": summary.get("distance"),
+        "calories": summary.get("calories"),
+        "average_hr": summary.get("averageHR"),
+        "max_hr": summary.get("maxHR"),
+        "average_speed_mps": summary.get("averageSpeed"),
+        "elevation_gain_meters": summary.get("elevationGain"),
+    }
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):

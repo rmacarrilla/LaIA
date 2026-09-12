@@ -45,7 +45,10 @@ En el primer login exitoso, la librería guarda un token de sesión (por defecto
 claude mcp add garmin-activities -- "$(pwd)/venv/bin/python" "$(pwd)/mcp_server.py"
 ```
 
-Registra el servidor en Claude Code (modo `stdio`). Expone una herramienta, `list_activities`, que Claude puede invocar directamente en el chat.
+Registra el servidor en Claude Code (modo `stdio`). Expone dos herramientas que Claude puede invocar directamente en el chat:
+
+- `list_activities`: últimas actividades (id, fecha y nombre).
+- `get_activity_detail`: detalle de una actividad (duración, distancia, calorías, frecuencia cardíaca, velocidad media, desnivel), a partir del `activity_id` devuelto por `list_activities`.
 
 ### Servidor MCP remoto (HTTP)
 
