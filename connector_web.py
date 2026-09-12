@@ -110,7 +110,7 @@ def connect(email: str = Form(...), password: str = Form(...)) -> HTMLResponse:
     if response.status_code != 200:
         return render_error("No se pudo verificar tu usuario y contraseña de Garmin.")
 
-    connector_url = f"{mcp_url}/?apiKey={os.environ['MCP_AUTH_TOKEN']}"
+    connector_url = f"{mcp_url}/mcp?apiKey={os.environ['MCP_AUTH_TOKEN']}"
     return render_success(connector_url)
 
 

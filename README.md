@@ -83,7 +83,7 @@ contraseña de Garmin. Al enviarlo:
 2. Si el login es válido, `mcp_server.py` sustituye la sesión cacheada (ver
    `GARMIN_TOKENSTORE`) por la de esa cuenta — a partir de ahí, `list_activities` y
    `get_activity_detail` sirven los datos de esa persona, sin redeploy.
-3. La web devuelve la URL del conector (`{MCP_PUBLIC_URL}/?apiKey={MCP_AUTH_TOKEN}`)
+3. La web devuelve la URL del conector (`{MCP_PUBLIC_URL}/mcp?apiKey={MCP_AUTH_TOKEN}`)
    lista para copiar y pegar en Claude, con instrucciones.
 
 **Importante**: solo hay una cuenta activa a la vez, compartiendo la misma URL de
