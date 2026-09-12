@@ -1,3 +1,8 @@
+"""Servidor MCP que expone las actividades de Garmin Connect de una única cuenta
+activa. Cada tool llama a get_client() en el momento, sin cachear el cliente, para
+que un cambio de cuenta vía /internal/login (ver internal_login) se refleje en la
+siguiente llamada sin reiniciar el proceso."""
+
 import os
 import shutil
 import tempfile
@@ -20,7 +25,7 @@ from shared_config import INTERNAL_LOGIN_PATH
 
 load_dotenv()
 
-mcp = MCPServer("garmin-activities")
+mcp = MCPServer("laia")
 
 
 @mcp.tool()
@@ -62,6 +67,12 @@ def get_activity_detail(activity_id: int) -> dict:
     }
 
 
+def _is_credential(value: object) -> bool:
+    """True para un string no vacío. request.json() puede devolver cualquier tipo
+    JSON, así que hay que comprobarlo antes de pasarlo a Garmin(...)."""
+    return isinstance(value, str) and bool(value)
+
+
 @mcp.custom_route(INTERNAL_LOGIN_PATH, methods=["POST"])
 async def internal_login(request: Request) -> JSONResponse:
     """Cambia la cuenta de Garmin activa para get_client(): hace login con las
@@ -73,7 +84,7 @@ async def internal_login(request: Request) -> JSONResponse:
     body = await request.json()
     email = body.get("email")
     password = body.get("password")
-    if not isinstance(email, str) or not isinstance(password, str) or not email or not password:
+    if not _is_credential(email) or not _is_credential(password):
         return JSONResponse({"error": "email and password are required"}, status_code=400)
 
     tokenstore = get_tokenstore()
@@ -120,6 +131,9 @@ if __name__ == "__main__":
         import uvicorn
         from mcp.server.transport_security import TransportSecuritySettings
 
+        # El SDK de MCP rechaza por defecto cualquier Host/Origin distinto de
+        # localhost (protección anti DNS-rebinding). Hay que autorizar
+        # explícitamente el dominio público que Railway inyecta en runtime.
         public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
         transport_security = (
             TransportSecuritySettings(

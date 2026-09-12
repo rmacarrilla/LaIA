@@ -1,5 +1,4 @@
 import os
-import sys
 
 from garminconnect import (
     Garmin,
@@ -7,6 +6,7 @@ from garminconnect import (
     GarminConnectConnectionError,
 )
 
+# Ruta por defecto de garminconnect cuando no se fija GARMIN_TOKENSTORE.
 DEFAULT_TOKENSTORE = os.path.expanduser("~/.garminconnect")
 
 
@@ -15,6 +15,11 @@ def get_tokenstore() -> str:
 
 
 def get_client() -> Garmin:
+    """Login contra Garmin Connect usando la sesión cacheada en get_tokenstore() si
+    es válida, o las credenciales de entorno si no. Se llama en cada tool call del
+    servidor MCP: un fallo aquí debe romper solo esa llamada, nunca el proceso
+    entero, así que se relanza como una excepción normal (no sys.exit) para que el
+    framework MCP la convierta en un error de herramienta."""
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
 
@@ -22,6 +27,6 @@ def get_client() -> Garmin:
         client = Garmin(email=email, password=password)
         client.login(get_tokenstore())
     except (GarminConnectAuthenticationError, GarminConnectConnectionError) as err:
-        sys.exit(f"No se pudo conectar con Garmin: {err}")
+        raise RuntimeError(f"No se pudo conectar con Garmin: {err}") from err
 
     return client

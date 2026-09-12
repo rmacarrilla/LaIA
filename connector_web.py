@@ -1,3 +1,8 @@
+"""Web de un solo formulario: recibe un email/contraseña de Garmin y, si son
+válidos, entrega la URL del conector MCP lista para pegar en Claude. No habla con
+Garmin directamente — reenvía las credenciales a mcp_server.py (POST
+INTERNAL_LOGIN_PATH), que es quien de verdad hace el login y cachea la sesión."""
+
 import os
 
 import requests
