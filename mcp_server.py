@@ -5,6 +5,7 @@ mcp.server.auth.middleware.auth_context.get_access_token() da el AccessToken de
 la petición en curso, cuyo `subject` es el id de ese usuario en Postgres."""
 
 import asyncio
+import html
 import os
 
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 import db
 import garmin_client
 from oauth_provider import GarminOAuthProvider
+from rate_limit import RateLimiter, RateLimitMiddleware
 
 load_dotenv()
 
@@ -44,16 +46,18 @@ async def _client_for_current_user() -> garmin_client.Garmin:
     lectura en Postgres es async; reconstruir el cliente desde el blob implica
     una llamada de red (Garmin recarga el perfil aunque la sesión ya esté
     autenticada), así que va en un hilo aparte igual que las llamadas de las
-    tools de abajo."""
+    tools de abajo. client_from_session_cached evita repetir esa llamada en
+    ráfagas de tool calls seguidas (ver garmin_client.py)."""
     token = get_access_token()
     if token is None or token.subject is None:
         raise RuntimeError("No hay ningún usuario autenticado en esta petición")
 
-    session_blob = await db.get_user_session(int(token.subject))
+    user_id = int(token.subject)
+    session_blob = await db.get_user_session(user_id)
     if session_blob is None:
         raise RuntimeError("Usuario no encontrado")
 
-    return await asyncio.to_thread(garmin_client.client_from_session, session_blob)
+    return await asyncio.to_thread(garmin_client.client_from_session_cached, user_id, session_blob)
 
 
 @mcp.tool()
@@ -119,14 +123,23 @@ def _page(body: str, status_code: int = 200) -> HTMLResponse:
     )
 
 
-def _login_form(flow_id: str, error: str | None = None) -> HTMLResponse:
-    error_html = f'<p class="error">{error}</p>' if error else ""
+def _login_form(flow_id: str, client_label: str, error: str | None = None) -> HTMLResponse:
+    # flow_id y error pueden venir de un POST directo con contenido arbitrario
+    # (no solo del formulario que servimos nosotros) — hay que escaparlos antes
+    # de meterlos en HTML, o un flow_id como '"><script>...' se ejecutaría en
+    # el navegador de quien reciba este enlace (XSS reflejado).
+    safe_flow_id = html.escape(flow_id, quote=True)
+    safe_client_label = html.escape(client_label)
+    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     return _page(f"""<h1>Conectar tu Garmin con Claude</h1>
-  <p>Introduce tu email y contraseña de Garmin Connect para que Claude pueda
-     consultar tus actividades.</p>
+  <p><strong>{safe_client_label}</strong> solicita acceso a tus actividades y datos
+     de entrenamiento de Garmin Connect (nombre, fecha, duración, distancia,
+     frecuencia cardíaca y similares). Solo continúa si reconoces y confías en
+     esta aplicación.</p>
+  <p>Introduce tu email y contraseña de Garmin Connect para autorizar el acceso:</p>
   {error_html}
   <form method="post" action="/login">
-    <input type="hidden" name="flow" value="{flow_id}">
+    <input type="hidden" name="flow" value="{safe_flow_id}">
     <label>Email
       <input type="email" name="email" required>
     </label>
@@ -137,6 +150,20 @@ def _login_form(flow_id: str, error: str | None = None) -> HTMLResponse:
   </form>""")
 
 
+async def _client_label_for_flow(flow_id: str) -> str:
+    """Nombre a mostrar en la pantalla de consentimiento: qué aplicación está
+    pidiendo acceso. Sin esto, cualquiera podría registrar su propio cliente
+    OAuth y mandar un enlace a nuestra pantalla de login real para hacer
+    phishing de credenciales de Garmin sin que la víctima note nada raro."""
+    pending = await _provider.load_pending_authorization(flow_id)
+    if pending is None:
+        return "una aplicación"
+    client = await _provider.get_client(pending.client_id)
+    if client is None:
+        return "una aplicación"
+    return client.client_name or client.client_id
+
+
 @mcp.custom_route("/login", methods=["GET"])
 async def login_form(request: Request) -> HTMLResponse:
     flow_id = request.query_params.get("flow", "")
@@ -145,7 +172,7 @@ async def login_form(request: Request) -> HTMLResponse:
         return _page(
             "<h1>Enlace caducado</h1><p>Vuelve a intentarlo desde Claude.</p>", status_code=400
         )
-    return _login_form(flow_id)
+    return _login_form(flow_id, await _client_label_for_flow(flow_id))
 
 
 @mcp.custom_route("/login", methods=["POST"])
@@ -158,9 +185,43 @@ async def login_submit(request: Request) -> Response:
     try:
         redirect_url = await _provider.complete_login(flow_id, email, password)
     except RuntimeError as err:
-        return _login_form(flow_id, error=str(err))
+        return _login_form(flow_id, await _client_label_for_flow(flow_id), error=str(err))
 
     return RedirectResponse(url=redirect_url, status_code=302)
+
+
+async def _connect_db_with_retry(database_url: str, attempts: int = 5) -> None:
+    """Reintenta con backoff exponencial si Postgres no responde todavía al
+    arrancar (p.ej. un redeploy simultáneo del plugin) — sin esto, una carrera
+    de arranque tumba el proceso entero en vez de esperar unos segundos."""
+    delay_seconds = 1.0
+    for attempt in range(1, attempts + 1):
+        try:
+            await db.connect(database_url)
+            return
+        except Exception:
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, 30)
+
+
+_CLEANUP_INTERVAL_SECONDS = 3600
+
+
+async def _cleanup_loop() -> None:
+    """Sin esto, los pending_authorize/authorization codes que nadie completa
+    (alguien cierra el navegador a medias) y los tokens ya caducados se
+    quedarían en la tabla para siempre — load_object solo limpia lo que
+    alguien vuelve a leer, no lo que nadie vuelve a tocar."""
+    while True:
+        await asyncio.sleep(_CLEANUP_INTERVAL_SECONDS)
+        try:
+            deleted = await db.purge_expired_objects()
+            if deleted:
+                print(f"[cleanup] borradas {deleted} filas caducadas de oauth_objects")
+        except Exception as err:  # nunca debe tumbar el proceso por un fallo puntual
+            print(f"[cleanup] fallo al limpiar oauth_objects (se reintenta en {_CLEANUP_INTERVAL_SECONDS}s): {err}")
 
 
 if __name__ == "__main__":
@@ -181,13 +242,28 @@ if __name__ == "__main__":
         )
 
         async def _main() -> None:
-            await db.connect(os.environ["DATABASE_URL"])
+            await _connect_db_with_retry(os.environ["DATABASE_URL"])
+            cleanup_task = asyncio.create_task(_cleanup_loop())
+
             app = mcp.streamable_http_app(transport_security=transport_security)
+            app.add_middleware(
+                RateLimitMiddleware,
+                limiters={
+                    # /login: fuerza bruta de credenciales de Garmin.
+                    "/login": RateLimiter(max_requests=10, window_seconds=900),
+                    # /register: alta de clientes OAuth, sin autenticación previa
+                    # por diseño (RFC 7591) y sin caducidad — limitar el ritmo
+                    # evita que se llene la tabla de golpe.
+                    "/register": RateLimiter(max_requests=20, window_seconds=3600),
+                },
+            )
+
             config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
             server = uvicorn.Server(config)
             try:
                 await server.serve()
             finally:
+                cleanup_task.cancel()
                 await db.disconnect()
 
         asyncio.run(_main())

@@ -31,9 +31,16 @@ cp .env.example .env
 
 ```
 DATABASE_URL=postgres://usuario:contraseña@host:5432/basededatos
+SESSION_ENCRYPTION_KEY=genera_un_valor_aleatorio
 ```
 
 `.env` está en `.gitignore` y nunca se sube al repositorio.
+
+`SESSION_ENCRYPTION_KEY` cifra en reposo la sesión de Garmin de cada usuario y
+sirve de clave para el hash de su email (ver `crypto_utils.py`) — no se guarda
+ningún dato personal en claro en Postgres. No la cambies una vez haya usuarios
+reales: perderías la capacidad de descifrar sus sesiones guardadas y tendrían
+que volver a conectarse.
 
 ## Uso
 
@@ -83,13 +90,30 @@ Flujo para una persona nueva:
 
 ### Base de datos
 
-`db.py` crea el esquema (`CREATE TABLE IF NOT EXISTS`) la primera vez que se
-conecta — no hay migraciones que ejecutar a mano. Dos tablas:
+`db.py` crea/actualiza el esquema (`CREATE`/`ALTER TABLE IF NOT EXISTS`) la
+primera vez que se conecta — no hay migraciones que ejecutar a mano. Dos tablas:
 
-- `users`: una fila por cuenta de Garmin (email + sesión serializada).
+- `users`: una fila por cuenta de Garmin. `garmin_email_hash` (nunca el email en
+  claro) identifica a la persona; `session_blob_encrypted` es su sesión de
+  Garmin cifrada con `SESSION_ENCRYPTION_KEY`.
 - `oauth_objects`: clientes OAuth registrados, authorization codes y access/
   refresh tokens — todo genérico (`kind`, `key`, `data` JSONB), porque son
-  justo los modelos que ya define el SDK de MCP.
+  justo los modelos que ya define el SDK de MCP. Las filas caducadas se
+  limpian solas (al leerlas, y además con una pasada periódica en segundo
+  plano — ver `_cleanup_loop` en `mcp_server.py`).
+
+### Seguridad
+
+- **Consentimiento**: la pantalla de `/login` muestra qué aplicación está
+  pidiendo acceso (`client_name` del cliente OAuth registrado) — sin esto,
+  cualquiera podría registrar su propio cliente y enviar un enlace a nuestra
+  pantalla de login real para phishear credenciales de Garmin.
+- **Rate limiting**: `/login` (fuerza bruta de credenciales) y `/register`
+  (alta de clientes OAuth, abierta por diseño y sin caducidad) están
+  limitados por IP en memoria (`rate_limit.py`) — suficiente para uso
+  personal/small-scale, no sustituye un WAF si esto creciera de verdad.
+- **PII y credenciales**: nunca en claro en Postgres (ver `crypto_utils.py`).
+  Ni el email ni la contraseña de Garmin se registran jamás en logs.
 
 ## Despliegue en Railway
 
@@ -102,7 +126,9 @@ en la base de datos, no en el filesystem.
 
 ```
 .
-├── garmin_client.py     # login/serialización de sesión de Garmin (sin estado)
+├── garmin_client.py     # login/serialización de sesión de Garmin + caché corto
+├── crypto_utils.py      # hash del email y cifrado de la sesión (PII en reposo)
+├── rate_limit.py        # limitador en memoria para /login y /register
 ├── db.py                # capa mínima sobre Postgres (asyncpg)
 ├── oauth_provider.py    # servidor de autorización OAuth (login de Garmin como "IdP")
 ├── mcp_server.py        # servidor MCP + rutas OAuth + /login
@@ -111,6 +137,13 @@ en la base de datos, no en el filesystem.
 ├── .env                 # credenciales reales (no versionado)
 └── venv/                # entorno virtual (no versionado)
 ```
+
+## Limitaciones conocidas
+
+- Sin autoservicio de borrado de cuenta todavía (derecho al olvido / GDPR
+  art. 17) — hoy habría que borrar la fila a mano en `users`.
+- El rate limiting es en memoria de un solo proceso: no protege de un ataque
+  distribuido de verdad ni se comparte entre réplicas.
 
 ## Licencia
 

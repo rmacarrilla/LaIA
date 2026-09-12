@@ -15,26 +15,46 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
 
 ## Arquitectura
 
-- **`garmin_client.py`**: dos funciones sin estado. `login(email, password)` hace
-  un login real (nunca con tokenstore, para no reutilizar por accidente la
-  sesión de otra cuenta) y devuelve `client.client.dumps()` — la sesión
-  serializada a JSON, en memoria, sin tocar disco (ojo: `dumps()`/`loads()`
-  viven en `Garmin.client`, no en el propio objeto `Garmin`). Lanza
-  `RuntimeError` en fallo, nunca `sys.exit()` — esta función corre dentro de un
-  servidor de larga duración; `sys.exit()` lanza `SystemExit`, que ni el
-  framework MCP ni el manejo de excepciones de Starlette capturan como una
-  `Exception` normal, así que tumbaría el proceso entero por un solo login
-  fallido (nos pasó de verdad en una versión anterior de este proyecto, single
-  usuario). `client_from_session(blob)` reconstruye un cliente autenticado a
-  partir de ese blob.
-- **`db.py`**: pool de `asyncpg` sobre `DATABASE_URL`. Tabla `users` (email →
-  sesión) y tabla genérica `oauth_objects` (`kind`, `key`, `data` JSONB,
+- **`garmin_client.py`**: sin estado salvo un caché corto en memoria.
+  `login(email, password)` hace un login real (nunca con tokenstore, para no
+  reutilizar por accidente la sesión de otra cuenta) y devuelve
+  `client.client.dumps()` — la sesión serializada a JSON, en memoria, sin
+  tocar disco (ojo: `dumps()`/`loads()` viven en `Garmin.client`, no en el
+  propio objeto `Garmin`). Lanza `RuntimeError` en fallo, nunca `sys.exit()`
+  — esta función corre dentro de un servidor de larga duración; `sys.exit()`
+  lanza `SystemExit`, que ni el framework MCP ni el manejo de excepciones de
+  Starlette capturan como una `Exception` normal, así que tumbaría el proceso
+  entero por un solo login fallido (nos pasó de verdad en una versión
+  anterior de este proyecto, single usuario). `client_from_session(blob)`
+  reconstruye un cliente autenticado a partir de ese blob — esto también hace
+  una llamada de red (Garmin recarga el perfil), así que
+  `client_from_session_cached(user_id, blob)` guarda el resultado 5 minutos
+  por `(user_id, blob)`: si cambia el blob (nuevo login), la clave cambia y el
+  caché se invalida solo, sin coordinar un `invalidate()` entre módulos.
+- **`crypto_utils.py`**: `SESSION_ENCRYPTION_KEY` cifra (Fernet) el
+  `session_blob` y sirve de clave de un HMAC-SHA256 para el email — nunca se
+  guarda el email en claro, solo su hash con clave (no se necesita para nada
+  más que comprobar "¿ya existe este usuario?", así que no hace falta poder
+  recuperarlo). Es la única pieza de PII/credenciales en Postgres, y por eso
+  es la única que se cifra/hashea.
+- **`rate_limit.py`**: `RateLimiter` (ventana deslizante en memoria, con
+  desalojo LRU acotado) y `RateLimitMiddleware`, que lo aplica por ruta a las
+  peticiones POST. Usado en `/login` (fuerza bruta de Garmin) y `/register`
+  (alta de clientes OAuth sin autenticación previa por diseño — RFC 7591 — y
+  sin caducidad).
+- **`db.py`**: pool de `asyncpg` sobre `DATABASE_URL` (`min_size=1,
+  max_size=5`: esta app no necesita el pool de 10 conexiones por defecto).
+  Tabla `users` (`garmin_email_hash`, `session_blob_encrypted` — nunca en
+  claro) y tabla genérica `oauth_objects` (`kind`, `key`, `data` JSONB,
   `expires_at`) para todo lo demás — clientes OAuth registrados, authorization
   codes, access/refresh tokens. Son ya modelos Pydantic del propio SDK de MCP
   (`OAuthClientInformationFull`, `AuthorizationCode`, `AccessToken`,
-  `RefreshToken`), así que guardarlos como JSON evita diseñar un esquema propio
-  para cada uno. Limpieza de caducados perezosa (se borran al leerlos, no hay
-  cron).
+  `RefreshToken`), así que guardarlos como JSON evita diseñar un esquema
+  propio para cada uno. `purge_expired_objects()` borra en bloque lo caducado
+  — sin esto, un `pending_authorize`/`code` que nadie completa se queda para
+  siempre (la limpieza de `load_object` solo se dispara al leer esa fila
+  concreta). `_migrate_legacy_rows()` es la migración, idempotente y de un
+  solo uso, desde el esquema anterior (email/sesión en claro) al actual.
 - **`oauth_provider.py`** (`GarminOAuthProvider`): implementa
   `mcp.server.auth.provider.OAuthAuthorizationServerProvider`. El SDK ya trae
   hechas las rutas `/authorize`, `/token`, `/register`, `/revoke` y los
@@ -72,6 +92,21 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
   `AccessToken` validado de la petición en curso; `.subject` es el `user_id` de
   Postgres. No hace falta cambiar la firma de las tools para acceder a esto —
   es un contextvar que rellena el propio middleware del SDK.
+- **Pantalla de consentimiento**: `/login` muestra el `client_name` (o
+  `client_id` si no hay nombre) del cliente OAuth que pide acceso
+  (`_client_label_for_flow` en `mcp_server.py`). Sin esto, cualquiera podría
+  registrar su propio cliente OAuth (DCR es público, sin autenticación) y
+  mandar un enlace a nuestra pantalla de login *real* para hacer phishing de
+  credenciales de Garmin — la víctima no tendría forma de notar que está
+  autorizando a una aplicación desconocida.
+- **XSS**: todo lo que se interpola en el HTML de `/login` (`flow_id`,
+  `client_label`, `error`) pasa por `html.escape()`. `flow_id` en particular
+  puede llegar de un POST directo con cualquier contenido (no solo del
+  formulario que servimos nosotros) — sin escapar, un `flow` tipo `"><script>`
+  se reflejaría tal cual en la respuesta.
+- **Arranque**: `_connect_db_with_retry` reintenta con backoff exponencial si
+  Postgres no responde a la primera (p.ej. una carrera de arranque con el
+  propio plugin de Postgres en Railway), en vez de morir directamente.
 
 ## Historia relevante
 

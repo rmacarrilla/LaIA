@@ -13,3 +13,6 @@ starlette==1.6.0
 
 # Cliente Postgres async, para el registro de usuarios y el estado OAuth
 asyncpg==0.31.0
+
+# Cifrado en reposo del email (con clave) y la sesión de Garmin (ver crypto_utils.py)
+cryptography==50.0.1
