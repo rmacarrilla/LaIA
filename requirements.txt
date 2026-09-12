@@ -10,3 +10,8 @@ mcp==2.1.1
 # Servidor HTTP para exponer el MCP como servicio remoto
 uvicorn==0.52.4
 starlette==1.6.0
+
+# Web de conexión (connector_web.py)
+fastapi==0.141.1
+python-multipart==0.0.32
+requests==2.34.2

@@ -1,6 +1,6 @@
 # Garmin MCP Server
 
-Servidor MCP en Python que expone tus últimas actividades de Garmin Connect como herramienta para Claude, usando la librería no oficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) — en local (`stdio`) o desplegado como servicio remoto con URL pública (HTTP).
+Servidor MCP en Python que expone tus últimas actividades de Garmin Connect como herramienta para Claude, usando la librería no oficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) — en local (`stdio`) o desplegado como servicio remoto con URL pública (HTTP). Incluye una web de conexión (`connector_web.py`) para obtener esa URL sin tener que copiarla a mano.
 
 ## Requisitos
 
@@ -31,6 +31,9 @@ GARMIN_PASSWORD=tu_contraseña
 
 # Solo necesaria si vas a exponer el servidor MCP por HTTP
 MCP_AUTH_TOKEN=genera_un_valor_aleatorio
+
+# Solo necesaria si vas a usar connector_web.py (clave distinta de MCP_AUTH_TOKEN)
+INTERNAL_LOGIN_TOKEN=genera_otro_valor_aleatorio
 ```
 
 `.env` está en `.gitignore` y nunca se sube al repositorio.
@@ -63,18 +66,54 @@ El acceso está protegido con una clave compartida (`MCP_AUTH_TOKEN`), que el cl
 - Cabecera `Authorization: Bearer <token>` (clientes MCP estándar).
 - Parámetro `?apiKey=<token>` en la URL (para enlaces de instalación de un clic, que no permiten configurar cabeceras).
 
+Además expone `POST /internal/login`, protegido con una clave distinta
+(`INTERNAL_LOGIN_TOKEN`), pensada únicamente para que la web de conexión
+(`connector_web.py`) cambie qué cuenta de Garmin sirve el MCP (ver más abajo).
+
+### Web de conexión (`connector_web.py`)
+
+```bash
+MCP_PUBLIC_URL=https://tu-mcp-server... INTERNAL_LOGIN_TOKEN=... MCP_AUTH_TOKEN=... python connector_web.py
+```
+
+Sirve un formulario donde cualquiera con acceso a la URL introduce un email y
+contraseña de Garmin. Al enviarlo:
+
+1. Llama a `POST /internal/login` en `mcp_server.py` con esas credenciales.
+2. Si el login es válido, `mcp_server.py` sustituye la sesión cacheada (ver
+   `GARMIN_TOKENSTORE`) por la de esa cuenta — a partir de ahí, `list_activities` y
+   `get_activity_detail` sirven los datos de esa persona, sin redeploy.
+3. La web devuelve la URL del conector (`{MCP_PUBLIC_URL}/?apiKey={MCP_AUTH_TOKEN}`)
+   lista para copiar y pegar en Claude, con instrucciones.
+
+**Importante**: solo hay una cuenta activa a la vez, compartiendo la misma URL de
+conector para todo el mundo — no es multiusuario real, es "quién inició sesión por
+última vez". Tampoco hay ninguna clave que proteja el propio formulario: cualquiera
+que conozca la URL de esta web y tenga una cuenta de Garmin válida (la suya propia)
+puede cambiar qué cuenta sirve el MCP. Aceptado como limitación conocida mientras sea
+un proyecto personal; a resolver cuando se diseñe un multiusuario real.
+
 ## Despliegue en Railway
 
-El proyecto se despliega como servicio web (`mcp_server.py`) con dominio público, `MCP_TRANSPORT=http`.
+El proyecto se despliega como dos servicios dentro del mismo proyecto de Railway,
+ambos con dominio público:
 
-Necesita un volumen persistente montado (p. ej. en `/data`) con `GARMIN_TOKENSTORE` apuntando a él — el filesystem de Railway es efímero, así que sin volumen cada ejecución reautenticaría con usuario/contraseña, aumentando el riesgo de bloqueo por rate limiting.
+- **`mcp_server.py`** (`MCP_TRANSPORT=http`): necesita un volumen persistente montado
+  (p. ej. en `/data`) con `GARMIN_TOKENSTORE` apuntando a él — el filesystem de
+  Railway es efímero, así que sin volumen cada ejecución reautenticaría con
+  usuario/contraseña, aumentando el riesgo de bloqueo por rate limiting.
+- **`connector_web.py`**: sin volumen (no cachea nada). Sus variables
+  `MCP_AUTH_TOKEN` e `INTERNAL_LOGIN_TOKEN` se configuran como referencias a las del
+  servicio anterior (`${{garmin-mcp-server.MCP_AUTH_TOKEN}}`, etc.) para no duplicar
+  los secretos.
 
 ## Estructura del proyecto
 
 ```
 .
-├── garmin_client.py       # login a Garmin
+├── garmin_client.py       # login a Garmin (usado por mcp_server.py)
 ├── mcp_server.py          # servidor MCP (local stdio / remoto HTTP)
+├── connector_web.py       # web para obtener la URL del conector
 ├── requirements.txt       # dependencias con versiones fijadas
 ├── .env.example            # plantilla de variables de entorno
 ├── .env                    # credenciales reales (no versionado)
