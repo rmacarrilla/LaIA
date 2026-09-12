@@ -3,6 +3,8 @@ activa. Cada tool llama a get_client() en el momento, sin cachear el cliente, pa
 que un cambio de cuenta vía /internal/login (ver internal_login) se refleje en la
 siguiente llamada sin reiniciar el proceso."""
 
+import asyncio
+import hmac
 import os
 import shutil
 import tempfile
@@ -73,54 +75,77 @@ def _is_credential(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _switch_active_account(email: str, password: str) -> None:
+    """Parte bloqueante de internal_login (login de red + E/S de disco): login en un
+    directorio temporal y, solo si tiene éxito, sustituye la sesión cacheada real —
+    un intento fallido no deja el MCP sin sesión utilizable. Se ejecuta en un hilo
+    aparte (ver internal_login) porque el login de Garmin puede tardar 10-20s
+    (esperas anti-bot deliberadas de la propia API) y esto es una función síncrona
+    normal: bloquearía el event loop entero si se llamara directamente desde una
+    función async, dejando el servidor sin responder a cualquier otra petición
+    mientras tanto."""
+    tokenstore = get_tokenstore()
+    final_token_path = token_file_path(tokenstore)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        Garmin(email=email, password=password).login(tmp_dir)  # puede lanzar GarminConnect*Error
+        final_token_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(token_file_path(tmp_dir)), str(final_token_path))
+        final_token_path.chmod(0o600)  # contiene un refresh token; nada de permisos por defecto
+
+
 @mcp.custom_route(INTERNAL_LOGIN_PATH, methods=["POST"])
 async def internal_login(request: Request) -> JSONResponse:
-    """Cambia la cuenta de Garmin activa para get_client(): hace login con las
-    credenciales recibidas en un directorio temporal (así garminconnect no puede
-    reutilizar ningún token cacheado y autentica de verdad) y solo si tiene éxito
-    sustituye la sesión cacheada real por la nueva — un intento fallido no deja el
-    MCP sin sesión utilizable. Llamado únicamente por connector_web.py, con un
-    secreto distinto (INTERNAL_LOGIN_TOKEN) al de los clientes MCP normales."""
+    """Cambia la cuenta de Garmin activa para get_client(). Llamado únicamente por
+    connector_web.py, con un secreto distinto (INTERNAL_LOGIN_TOKEN) al de los
+    clientes MCP normales."""
     body = await request.json()
     email = body.get("email")
     password = body.get("password")
     if not _is_credential(email) or not _is_credential(password):
         return JSONResponse({"error": "email and password are required"}, status_code=400)
 
-    tokenstore = get_tokenstore()
-    final_token_path = token_file_path(tokenstore)
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        try:
-            Garmin(email=email, password=password).login(tmp_dir)
-        except (
-            GarminConnectAuthenticationError,
-            GarminConnectConnectionError,
-            GarminConnectTooManyRequestsError,
-        ) as err:
-            return JSONResponse({"error": f"login failed: {err}"}, status_code=401)
-
-        final_token_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(token_file_path(tmp_dir)), str(final_token_path))
+    try:
+        await asyncio.to_thread(_switch_active_account, email, password)
+    except (
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+        GarminConnectTooManyRequestsError,
+    ) as err:
+        return JSONResponse({"error": f"login failed: {err}"}, status_code=401)
 
     return JSONResponse({"status": "ok"})
 
 
+def _matches(received: str | None, expected: str) -> bool:
+    """Compara un secreto en tiempo constante: `==` sobre strings compara byte a
+    byte y corta en el primer fallo, lo que en teoría permite adivinar un token por
+    el tiempo de respuesta. hmac.compare_digest no tiene ese problema."""
+    return received is not None and hmac.compare_digest(received, expected)
+
+
 class BearerTokenMiddleware(BaseHTTPMiddleware):
     """Rechaza cualquier petición que no traiga la clave compartida correcta: los
-    clientes MCP normales (cabecera Authorization o ?apiKey=) usan MCP_AUTH_TOKEN;
-    la web de conexión, al llamar a INTERNAL_LOGIN_PATH, usa INTERNAL_LOGIN_TOKEN."""
+    clientes MCP normales (cabecera Authorization o ?apiKey=) usan mcp_auth_token;
+    la web de conexión, al llamar a INTERNAL_LOGIN_PATH, usa internal_login_token.
+    Los tokens se reciben ya resueltos (en vez de leerlos de os.environ en cada
+    petición) para que un despliegue sin las variables configuradas falle al
+    arrancar, no en la primera petición real."""
+
+    def __init__(self, app, mcp_auth_token: str, internal_login_token: str) -> None:
+        super().__init__(app)
+        self._mcp_auth_token = mcp_auth_token
+        self._internal_login_token = internal_login_token
 
     async def dispatch(self, request: Request, call_next):
         expected = (
-            os.environ["INTERNAL_LOGIN_TOKEN"]
+            self._internal_login_token
             if request.url.path == INTERNAL_LOGIN_PATH
-            else os.environ["MCP_AUTH_TOKEN"]
+            else self._mcp_auth_token
         )
-        authorized = (
-            request.headers.get("authorization") == f"Bearer {expected}"
-            or request.query_params.get("apiKey") == expected
-        )
+        header_ok = _matches(request.headers.get("authorization"), f"Bearer {expected}")
+        query_ok = _matches(request.query_params.get("apiKey"), expected)
+        authorized = header_ok or query_ok
         if not authorized:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
@@ -145,7 +170,11 @@ if __name__ == "__main__":
         )
 
         app = mcp.streamable_http_app(transport_security=transport_security)
-        app.add_middleware(BearerTokenMiddleware)
+        app.add_middleware(
+            BearerTokenMiddleware,
+            mcp_auth_token=os.environ["MCP_AUTH_TOKEN"],
+            internal_login_token=os.environ["INTERNAL_LOGIN_TOKEN"],
+        )
         uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
     else:
         mcp.run()
