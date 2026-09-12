@@ -1,30 +1,93 @@
 # LaIA
 
-Servidor MCP en Python que consulta las últimas actividades de una cuenta de Garmin Connect vía la librería no oficial `garminconnect`, para uso personal, y las expone a Claude (local o remoto). Incluye una web (`connector_web.py`) para cambiar qué cuenta de Garmin sirve el MCP y obtener la URL del conector.
+Servidor MCP multiusuario en Python que expone las actividades de Garmin Connect
+a Claude. Cada persona se conecta con su propia cuenta vía OAuth; no hay cuenta
+"por defecto" ni token compartido.
 
 ## Comandos
 
 ```bash
 source venv/bin/activate         # activar entorno virtual
-python mcp_server.py             # servidor MCP en local (stdio)
-MCP_TRANSPORT=http python mcp_server.py  # servidor MCP remoto (HTTP)
-python connector_web.py          # web de conexión (necesita MCP_PUBLIC_URL, MCP_AUTH_TOKEN, INTERNAL_LOGIN_TOKEN)
+python mcp_server.py             # servidor MCP en local (stdio, sin OAuth)
+MCP_TRANSPORT=http python mcp_server.py  # servidor MCP remoto (HTTP + OAuth)
 pip install -r requirements.txt  # instalar/actualizar dependencias
 ```
 
-## Convenciones del proyecto
+## Arquitectura
 
-- Las credenciales viven en `.env` (nunca en el código ni en commits). `.env.example` documenta las claves esperadas.
-- `requirements.txt` fija versiones exactas (`==`), no rangos, para reproducibilidad.
-- El login a Garmin está centralizado en `garmin_client.py` (`get_client()`, `get_tokenstore()`), reutilizado por `mcp_server.py`.
-- `shared_config.py` guarda constantes usadas tanto por `mcp_server.py` como por `connector_web.py` (hoy, `INTERNAL_LOGIN_PATH`) para que no puedan desincronizarse entre los dos ficheros.
-- El login usa caché de tokens (por defecto en `~/.garminconnect`, configurable con `GARMIN_TOKENSTORE`) para evitar reautenticar con usuario/contraseña en cada ejecución y reducir rate limiting (errores 429) de Garmin. En Railway esto requiere un volumen persistente, ya que el filesystem es efímero.
-- `get_client()` captura `GarminConnectAuthenticationError`/`GarminConnectConnectionError` y las relanza como `RuntimeError` con un mensaje claro. Importante: NO usa `sys.exit()` — `get_client()` se llama en cada tool call dentro del servidor HTTP, y `sys.exit()` lanza `SystemExit`, que el framework MCP no captura (solo captura `Exception`); habría tumbado el proceso entero por un solo login fallido.
-- `mcp_server.py` arranca en modo `stdio` por defecto y en modo HTTP si `MCP_TRANSPORT=http`. En modo HTTP, el acceso está protegido con una clave compartida (`MCP_AUTH_TOKEN`), aceptada por cabecera `Authorization: Bearer` o por `?apiKey=` en la URL (para enlaces de instalación de un clic). No hay gestión de usuarios: es un servidor de un único usuario, pensado para uso personal.
-- `mcp_server.py` también expone `POST /internal/login` (vía `@mcp.custom_route`), protegido con una clave distinta (`INTERNAL_LOGIN_TOKEN`). Recibe email/password, hace login en un directorio temporal (para no arriesgar la sesión ya cacheada si falla) y solo si tiene éxito sustituye el token cacheado (`GARMIN_TOKENSTORE`, permisos forzados a `0600`) por el nuevo — así `get_client()` sirve esa cuenta en las siguientes llamadas, sin redeploy. No verificar primero en un directorio aislado dejaría el MCP sin sesión utilizable ante un intento fallido (ya ocurrió en desarrollo).
-- La parte bloqueante de `internal_login` (`_switch_active_account`: login de red + E/S de disco) se ejecuta con `asyncio.to_thread`, nunca directamente en la corrutina. El login de Garmin puede tardar 10-20s (esperas anti-bot deliberadas de la propia API); llamarlo síncronamente desde una función `async` bloquearía el event loop entero, dejando el servidor sin responder a cualquier otra petición mientras tanto. Las tools normales (`list_activities`, etc.) no tienen este problema porque el framework MCP ya las despacha a un hilo automáticamente.
-- `BearerTokenMiddleware` recibe los tokens ya resueltos por el constructor (no los lee de `os.environ` en cada petición), para que un despliegue sin `MCP_AUTH_TOKEN`/`INTERNAL_LOGIN_TOKEN` configuradas falle al arrancar (traceback claro en los logs) en vez de fallar de forma opaca en la primera petición real. La comparación del token recibido contra el esperado usa `hmac.compare_digest` (tiempo constante), no `==` — evita que el tiempo de respuesta filtre información útil para adivinar el secreto byte a byte.
-- `connector_web.py` es la interfaz para lo anterior: un formulario que reenvía las credenciales a `/internal/login` y, si el login es válido, muestra la URL del conector (`{MCP_PUBLIC_URL}/mcp?apiKey={MCP_AUTH_TOKEN}`) lista para pegar en Claude. No importa `garminconnect` directamente, es solo UI + proxy HTTP. Importante: el path es `/mcp` (donde vive de verdad el protocolo), no la raíz `/` — apuntar a la raíz hace que la comprobación previa de Claude reciba un 404 y lo interprete como que el servidor exige login (ya pasó en producción).
-- Limitación conocida y aceptada: no hay clave que proteja el formulario de `connector_web.py`, así que cualquiera con la URL y una cuenta de Garmin propia puede cambiar qué cuenta sirve el MCP. Solo hay una cuenta activa a la vez (no es multiusuario real). A revisar cuando se diseñe multiusuario.
-- Despliegue en Railway: dos servicios en el mismo proyecto (`garmin-activities`) — `laia-mcp-server` (`mcp_server.py`, con volumen montado para la caché de tokens) y `laia-connector-web` (`connector_web.py`, sin volumen), este último con `MCP_AUTH_TOKEN`/`INTERNAL_LOGIN_TOKEN` como referencias cruzadas a las variables del primero para no duplicar secretos.
-- Repo en GitHub: `rmacarrilla/LaIA` (renombrado desde `garmin_mcp_server`, y antes `garmin-activities`). Cada rename de repo rompe la conexión GitHub↔Railway para auto-deploy en push — hay que reconectar el source de cada servicio (`connect-service-source`) tras renombrar, y además actualizar manualmente en GitHub el acceso de la GitHub App de Railway al repo con su nombre nuevo si no aparece en el selector.
+- **`garmin_client.py`**: dos funciones sin estado. `login(email, password)` hace
+  un login real (nunca con tokenstore, para no reutilizar por accidente la
+  sesión de otra cuenta) y devuelve `client.client.dumps()` — la sesión
+  serializada a JSON, en memoria, sin tocar disco (ojo: `dumps()`/`loads()`
+  viven en `Garmin.client`, no en el propio objeto `Garmin`). Lanza
+  `RuntimeError` en fallo, nunca `sys.exit()` — esta función corre dentro de un
+  servidor de larga duración; `sys.exit()` lanza `SystemExit`, que ni el
+  framework MCP ni el manejo de excepciones de Starlette capturan como una
+  `Exception` normal, así que tumbaría el proceso entero por un solo login
+  fallido (nos pasó de verdad en una versión anterior de este proyecto, single
+  usuario). `client_from_session(blob)` reconstruye un cliente autenticado a
+  partir de ese blob.
+- **`db.py`**: pool de `asyncpg` sobre `DATABASE_URL`. Tabla `users` (email →
+  sesión) y tabla genérica `oauth_objects` (`kind`, `key`, `data` JSONB,
+  `expires_at`) para todo lo demás — clientes OAuth registrados, authorization
+  codes, access/refresh tokens. Son ya modelos Pydantic del propio SDK de MCP
+  (`OAuthClientInformationFull`, `AuthorizationCode`, `AccessToken`,
+  `RefreshToken`), así que guardarlos como JSON evita diseñar un esquema propio
+  para cada uno. Limpieza de caducados perezosa (se borran al leerlos, no hay
+  cron).
+- **`oauth_provider.py`** (`GarminOAuthProvider`): implementa
+  `mcp.server.auth.provider.OAuthAuthorizationServerProvider`. El SDK ya trae
+  hechas las rutas `/authorize`, `/token`, `/register`, `/revoke` y los
+  `.well-known/...` (`mcp/server/auth/routes.py`) — este fichero es la única
+  pieza que hay que escribir. `authorize()` no redirige a un IdP de terceros
+  (no existe: Garmin no tiene OAuth público) — redirige a nuestra propia
+  `/login` (en `mcp_server.py`), guardando los parámetros originales de la
+  petición (`AuthorizationParams`) bajo `kind='pending_authorize'` mientras
+  tanto. `complete_login()` es lo que `/login` llama al recibir el formulario:
+  hace el login de Garmin, da de alta/actualiza el usuario (el email de Garmin
+  es la identidad duradera — volver a loguearse con el mismo email siempre da
+  el mismo `user_id`, y por tanto el mismo `subject` en los tokens), emite el
+  `AuthorizationCode` y devuelve la URL de vuelta a Claude
+  (`construct_redirect_uri`, ya provisto por el SDK). El resto de métodos
+  (`exchange_authorization_code`, `exchange_refresh_token`, `load_access_token`,
+  `revoke_token`) son operaciones CRUD directas sobre `db.py`. El SDK valida
+  PKCE, expiración y que el `redirect_uri` no cambie entre `/authorize` y
+  `/token` — no hay que reimplementar nada de eso.
+- **`mcp_server.py`**: construye `MCPServer("laia", auth_server_provider=...,
+  auth=AuthSettings(...))` — con eso el SDK monta solo todas las rutas OAuth.
+  Las tools (`list_activities`, `get_activity_detail`) son `async def` (antes no
+  lo eran) porque necesitan `await` para leer la sesión de Postgres. Esto tiene
+  una trampa: el framework MCP solo despacha a un hilo las tools **síncronas**
+  (`anyio.to_thread.run_sync`, confirmado leyendo
+  `mcp/server/mcpserver/utilities/func_metadata.py`); una tool `async def` se
+  ejecuta directamente en el event loop, así que las llamadas bloqueantes
+  dentro (`client.get_activities(...)`, reconstruir el cliente desde el blob)
+  hay que envolverlas explícitamente en `asyncio.to_thread` — si no, se
+  reintroduce el mismo bug de bloquear el servidor entero que ya se corrigió una
+  vez en la versión anterior (monousuario) de `internal_login`. La ruta
+  `/login` (GET muestra el formulario, POST lo procesa) es pública a propósito
+  — es la puerta de entrada, no puede exigir un token que aún no existe.
+- **Identidad de quien llama**: dentro de una tool,
+  `mcp.server.auth.middleware.auth_context.get_access_token()` devuelve el
+  `AccessToken` validado de la petición en curso; `.subject` es el `user_id` de
+  Postgres. No hace falta cambiar la firma de las tools para acceder a esto —
+  es un contextvar que rellena el propio middleware del SDK.
+
+## Historia relevante
+
+- Versión anterior (single-usuario): una única cuenta "activa" compartida,
+  cambiada vía `POST /internal/login` protegido con un token fijo, servida por
+  dos servicios Railway (`laia-mcp-server` + `laia-connector-web`) y un volumen
+  para cachear la sesión en disco. Se retiró por completo al pasar a OAuth
+  multiusuario: `connector_web.py` y `shared_config.py` desaparecieron (su HTML
+  se reaprovechó en la ruta `/login`), y con ellos el volumen y las variables
+  `GARMIN_EMAIL`/`GARMIN_PASSWORD`/`MCP_AUTH_TOKEN`/`INTERNAL_LOGIN_TOKEN` (ya
+  no hay cuenta por defecto ni token compartido).
+- Despliegue en Railway: un único servicio (`laia-mcp-server`) más un plugin de
+  Postgres gestionado (`DATABASE_URL`). Proyecto de Railway: `garmin-activities`.
+  Repo en GitHub: `rmacarrilla/LaIA` (renombrado desde `garmin_mcp_server`, y
+  antes `garmin-activities`). Cada rename de repo rompe la conexión
+  GitHub↔Railway para auto-deploy en push — hay que reconectar el source de
+  cada servicio (`connect-service-source`) tras renombrar, y además actualizar
+  manualmente en GitHub el acceso de la GitHub App de Railway al repo con su
+  nombre nuevo si no aparece en el selector.

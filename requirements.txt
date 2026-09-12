@@ -11,7 +11,5 @@ mcp==2.1.1
 uvicorn==0.52.4
 starlette==1.6.0
 
-# Web de conexión (connector_web.py)
-fastapi==0.141.1
-python-multipart==0.0.32
-requests==2.34.2
+# Cliente Postgres async, para el registro de usuarios y el estado OAuth
+asyncpg==0.31.0

@@ -1,11 +1,17 @@
 # LaIA
 
-Servidor MCP en Python que expone tus últimas actividades de Garmin Connect como herramienta para Claude, usando la librería no oficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) — en local (`stdio`) o desplegado como servicio remoto con URL pública (HTTP). Incluye una web de conexión (`connector_web.py`) para obtener esa URL sin tener que copiarla a mano.
+Servidor MCP multiusuario en Python que expone las últimas actividades de Garmin
+Connect como herramienta para Claude, usando la librería no oficial
+[`garminconnect`](https://github.com/cyberjunky/python-garminconnect). Cada
+persona se conecta con su propia cuenta de Garmin mediante un flujo OAuth — no
+hay contraseñas ni tokens que copiar y pegar a mano, ni una URL secreta que
+compartir.
 
 ## Requisitos
 
 - Python 3.10+
 - Una cuenta de Garmin Connect
+- Una base de datos Postgres (para el registro de usuarios y el estado OAuth)
 
 ## Instalación
 
@@ -23,22 +29,11 @@ Copia la plantilla de variables de entorno y rellénala:
 cp .env.example .env
 ```
 
-Edita `.env`:
-
 ```
-GARMIN_EMAIL=tu_correo@ejemplo.com
-GARMIN_PASSWORD=tu_contraseña
-
-# Solo necesaria si vas a exponer el servidor MCP por HTTP
-MCP_AUTH_TOKEN=genera_un_valor_aleatorio
-
-# Solo necesaria si vas a usar connector_web.py (clave distinta de MCP_AUTH_TOKEN)
-INTERNAL_LOGIN_TOKEN=genera_otro_valor_aleatorio
+DATABASE_URL=postgres://usuario:contraseña@host:5432/basededatos
 ```
 
 `.env` está en `.gitignore` y nunca se sube al repositorio.
-
-En el primer login exitoso, la librería guarda un token de sesión (por defecto en `~/.garminconnect`, configurable con `GARMIN_TOKENSTORE`), que se reutiliza en ejecuciones posteriores para evitar volver a autenticar con usuario/contraseña cada vez y reducir el riesgo de rate limiting (429) de Garmin.
 
 ## Uso
 
@@ -48,79 +43,73 @@ En el primer login exitoso, la librería guarda un token de sesión (por defecto
 claude mcp add laia -- "$(pwd)/venv/bin/python" "$(pwd)/mcp_server.py"
 ```
 
-Registra el servidor en Claude Code (modo `stdio`). Expone dos herramientas que Claude puede invocar directamente en el chat:
+Registra el servidor en Claude Code (modo `stdio`, sin OAuth — pensado para
+desarrollo con tu propia cuenta, no para servir a otras personas). Expone dos
+herramientas:
 
-- `list_activities`: últimas actividades (id, fecha y nombre).
-- `get_activity_detail`: detalle de una actividad (duración, distancia, calorías, frecuencia cardíaca, velocidad media, desnivel), a partir del `activity_id` devuelto por `list_activities`.
+- `list_activities`: últimas actividades (id, fecha y nombre) de quien está
+  autenticado.
+- `get_activity_detail`: detalle de una actividad (duración, distancia,
+  calorías, frecuencia cardíaca, velocidad media, desnivel), a partir del
+  `activity_id` devuelto por `list_activities`.
 
-### Servidor MCP remoto (HTTP)
+### Servidor MCP remoto (HTTP + OAuth)
 
 ```bash
 MCP_TRANSPORT=http python mcp_server.py
 ```
 
-Arranca el mismo servidor escuchando en `PORT` (por defecto 8000) en vez de por `stdio`. Pensado para desplegarse como servicio siempre activo (p. ej. en Railway) con una URL pública.
+Arranca el mismo servidor escuchando en `PORT` (por defecto 8000), con
+autenticación OAuth 2.1 completa (Dynamic Client Registration, authorization
+code + PKCE, refresh tokens) usando el soporte nativo del SDK de MCP
+(`mcp.server.auth`). No hay un IdP externo: el propio `/authorize` redirige a
+`/login`, un formulario donde la persona introduce su email y contraseña de
+Garmin — ese login **es** la autenticación, no hace falta ningún sistema de
+usuarios/contraseñas propio.
 
-El acceso está protegido con una clave compartida (`MCP_AUTH_TOKEN`), que el cliente debe enviar de una de estas dos formas:
+Flujo para una persona nueva:
 
-- Cabecera `Authorization: Bearer <token>` (clientes MCP estándar).
-- Parámetro `?apiKey=<token>` en la URL (para enlaces de instalación de un clic, que no permiten configurar cabeceras).
+1. Añade el conector en Claude apuntando a `https://tu-servidor/mcp` (sin nada
+   más en la URL).
+2. Claude se autorregistra como cliente OAuth y redirige al navegador a
+   `/authorize` → `/login`.
+3. La persona mete su email y contraseña de Garmin. Si son válidas,
+   `oauth_provider.py` da de alta (o actualiza) su usuario en Postgres, emite un
+   authorization code y redirige de vuelta a Claude.
+4. Claude canjea el code por un access token + refresh token. A partir de ahí,
+   cada llamada a una tool usa la sesión de Garmin de esa persona — nunca la de
+   otra — y el token se refresca solo cuando caduca, sin volver a pedir la
+   contraseña.
 
-Además expone `POST /internal/login`, protegido con una clave distinta
-(`INTERNAL_LOGIN_TOKEN`), pensada únicamente para que la web de conexión
-(`connector_web.py`) cambie qué cuenta de Garmin sirve el MCP (ver más abajo).
+### Base de datos
 
-### Web de conexión (`connector_web.py`)
+`db.py` crea el esquema (`CREATE TABLE IF NOT EXISTS`) la primera vez que se
+conecta — no hay migraciones que ejecutar a mano. Dos tablas:
 
-```bash
-MCP_PUBLIC_URL=https://tu-mcp-server... INTERNAL_LOGIN_TOKEN=... MCP_AUTH_TOKEN=... python connector_web.py
-```
-
-Sirve un formulario donde cualquiera con acceso a la URL introduce un email y
-contraseña de Garmin. Al enviarlo:
-
-1. Llama a `POST /internal/login` en `mcp_server.py` con esas credenciales.
-2. Si el login es válido, `mcp_server.py` sustituye la sesión cacheada (ver
-   `GARMIN_TOKENSTORE`) por la de esa cuenta — a partir de ahí, `list_activities` y
-   `get_activity_detail` sirven los datos de esa persona, sin redeploy.
-3. La web devuelve la URL del conector (`{MCP_PUBLIC_URL}/mcp?apiKey={MCP_AUTH_TOKEN}`)
-   lista para copiar y pegar en Claude, con instrucciones.
-
-**Importante**: solo hay una cuenta activa a la vez, compartiendo la misma URL de
-conector para todo el mundo — no es multiusuario real, es "quién inició sesión por
-última vez". Tampoco hay ninguna clave que proteja el propio formulario: cualquiera
-que conozca la URL de esta web y tenga una cuenta de Garmin válida (la suya propia)
-puede cambiar qué cuenta sirve el MCP. Aceptado como limitación conocida mientras sea
-un proyecto personal; a resolver cuando se diseñe un multiusuario real.
+- `users`: una fila por cuenta de Garmin (email + sesión serializada).
+- `oauth_objects`: clientes OAuth registrados, authorization codes y access/
+  refresh tokens — todo genérico (`kind`, `key`, `data` JSONB), porque son
+  justo los modelos que ya define el SDK de MCP.
 
 ## Despliegue en Railway
 
-El proyecto se despliega como dos servicios dentro del mismo proyecto de Railway,
-ambos con dominio público:
-
-- **`mcp_server.py`** (`MCP_TRANSPORT=http`): necesita un volumen persistente montado
-  (p. ej. en `/data`) con `GARMIN_TOKENSTORE` apuntando a él — el filesystem de
-  Railway es efímero, así que sin volumen cada ejecución reautenticaría con
-  usuario/contraseña, aumentando el riesgo de bloqueo por rate limiting.
-- **`connector_web.py`**: sin volumen (no cachea nada). Sus variables
-  `MCP_AUTH_TOKEN` e `INTERNAL_LOGIN_TOKEN` se configuran como referencias a las del
-  servicio anterior (`${{laia-mcp-server.MCP_AUTH_TOKEN}}`, etc.) para no duplicar
-  los secretos.
-
-Los dos servicios en Railway se llaman `laia-mcp-server` y `laia-connector-web`.
+Un único servicio (`laia-mcp-server`) más un plugin de Postgres gestionado por
+Railway (variable `DATABASE_URL`, referenciable por el servicio como
+`${{Postgres.DATABASE_URL}}`). No hace falta ningún volumen: las sesiones viven
+en la base de datos, no en el filesystem.
 
 ## Estructura del proyecto
 
 ```
 .
-├── garmin_client.py       # login a Garmin (usado por mcp_server.py)
-├── shared_config.py       # constantes compartidas entre mcp_server.py y connector_web.py
-├── mcp_server.py          # servidor MCP (local stdio / remoto HTTP)
-├── connector_web.py       # web para obtener la URL del conector
-├── requirements.txt       # dependencias con versiones fijadas
-├── .env.example            # plantilla de variables de entorno
-├── .env                    # credenciales reales (no versionado)
-└── venv/                   # entorno virtual (no versionado)
+├── garmin_client.py     # login/serialización de sesión de Garmin (sin estado)
+├── db.py                # capa mínima sobre Postgres (asyncpg)
+├── oauth_provider.py    # servidor de autorización OAuth (login de Garmin como "IdP")
+├── mcp_server.py        # servidor MCP + rutas OAuth + /login
+├── requirements.txt     # dependencias con versiones fijadas
+├── .env.example         # plantilla de variables de entorno
+├── .env                 # credenciales reales (no versionado)
+└── venv/                # entorno virtual (no versionado)
 ```
 
 ## Licencia
