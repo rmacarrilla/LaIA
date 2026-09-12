@@ -16,7 +16,8 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
 
 - Las credenciales viven en `.env` (nunca en el código ni en commits). `.env.example` documenta las claves esperadas.
 - `requirements.txt` fija versiones exactas (`==`), no rangos, para reproducibilidad.
-- El login a Garmin está centralizado en `garmin_client.py` (`get_client()`), reutilizado por `mcp_server.py`.
+- El login a Garmin está centralizado en `garmin_client.py` (`get_client()`, `get_tokenstore()`), reutilizado por `mcp_server.py`.
+- `shared_config.py` guarda constantes usadas tanto por `mcp_server.py` como por `connector_web.py` (hoy, `INTERNAL_LOGIN_PATH`) para que no puedan desincronizarse entre los dos ficheros.
 - El login usa caché de tokens (por defecto en `~/.garminconnect`, configurable con `GARMIN_TOKENSTORE`) para evitar reautenticar con usuario/contraseña en cada ejecución y reducir rate limiting (errores 429) de Garmin. En Railway esto requiere un volumen persistente, ya que el filesystem es efímero.
 - Errores de login/conexión se capturan explícitamente (`GarminConnectAuthenticationError`, `GarminConnectConnectionError`) y terminan el programa con `sys.exit(mensaje)` en vez de un traceback crudo.
 - `mcp_server.py` arranca en modo `stdio` por defecto y en modo HTTP si `MCP_TRANSPORT=http`. En modo HTTP, el acceso está protegido con una clave compartida (`MCP_AUTH_TOKEN`), aceptada por cabecera `Authorization: Bearer` o por `?apiKey=` en la URL (para enlaces de instalación de un clic). No hay gestión de usuarios: es un servidor de un único usuario, pensado para uso personal.

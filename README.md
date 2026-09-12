@@ -114,6 +114,7 @@ Los dos servicios en Railway se llaman `laia-mcp-server` y `laia-connector-web`.
 ```
 .
 ├── garmin_client.py       # login a Garmin (usado por mcp_server.py)
+├── shared_config.py       # constantes compartidas entre mcp_server.py y connector_web.py
 ├── mcp_server.py          # servidor MCP (local stdio / remoto HTTP)
 ├── connector_web.py       # web para obtener la URL del conector
 ├── requirements.txt       # dependencias con versiones fijadas

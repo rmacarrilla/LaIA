@@ -5,12 +5,11 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
 
+from shared_config import INTERNAL_LOGIN_PATH
+
 load_dotenv()
 
 app = FastAPI()
-
-# Debe coincidir con INTERNAL_LOGIN_PATH en mcp_server.py.
-INTERNAL_LOGIN_PATH = "/internal/login"
 
 PAGE_STYLE = """
 <style>
@@ -25,15 +24,21 @@ PAGE_STYLE = """
 </style>
 """
 
-FORM_PAGE = f"""<!doctype html>
+
+def render_page(body: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        f"""<!doctype html>
 <html lang="es">
-<head>
-  <meta charset="utf-8">
-  <title>Conectar Garmin con Claude</title>
-  {PAGE_STYLE}
-</head>
+<head><meta charset="utf-8"><title>Conectar Garmin con Claude</title>{PAGE_STYLE}</head>
 <body>
-  <h1>Conectar tu Garmin con Claude</h1>
+{body}
+</body>
+</html>""",
+        status_code=status_code,
+    )
+
+
+FORM_PAGE = render_page("""<h1>Conectar tu Garmin con Claude</h1>
   <p>Introduce tu email y contraseña de Garmin Connect para obtener la URL del
      conector MCP que tienes que pegar en Claude.</p>
   <form method="post" action="/connect">
@@ -44,32 +49,20 @@ FORM_PAGE = f"""<!doctype html>
       <input type="password" name="password" required>
     </label>
     <button type="submit">Conectar</button>
-  </form>
-</body>
-</html>"""
+  </form>""")
 
 
 def render_error(message: str) -> HTMLResponse:
-    return HTMLResponse(
-        f"""<!doctype html>
-<html lang="es">
-<head><meta charset="utf-8"><title>Conectar Garmin con Claude</title>{PAGE_STYLE}</head>
-<body>
-  <h1>Conectar tu Garmin con Claude</h1>
+    return render_page(
+        f"""<h1>Conectar tu Garmin con Claude</h1>
   <p class="error">{message}</p>
-  <p><a href="/">Volver a intentarlo</a></p>
-</body>
-</html>""",
+  <p><a href="/">Volver a intentarlo</a></p>""",
         status_code=400,
     )
 
 
 def render_success(connector_url: str) -> HTMLResponse:
-    return HTMLResponse(f"""<!doctype html>
-<html lang="es">
-<head><meta charset="utf-8"><title>Conectar Garmin con Claude</title>{PAGE_STYLE}</head>
-<body>
-  <h1>¡Listo!</h1>
+    return render_page(f"""<h1>¡Listo!</h1>
   <p>Copia esta URL y pégala en Claude para añadir el conector de Garmin:</p>
   <div class="url-box">
     <input id="url" type="text" value="{connector_url}" readonly>
@@ -81,17 +74,15 @@ def render_success(connector_url: str) -> HTMLResponse:
     <li>Pega la URL de arriba.</li>
     <li>Dale un nombre, por ejemplo "Garmin".</li>
     <li>Guarda. Ya puedes pedirle a Claude tus actividades de Garmin.</li>
-  </ol>
-</body>
-</html>""")
+  </ol>""")
 
 
-@app.get("/", response_class=HTMLResponse)
-def form() -> str:
+@app.get("/")
+def form() -> HTMLResponse:
     return FORM_PAGE
 
 
-@app.post("/connect", response_class=HTMLResponse)
+@app.post("/connect")
 def connect(email: str = Form(...), password: str = Form(...)) -> HTMLResponse:
     mcp_url = os.environ["MCP_PUBLIC_URL"]
 

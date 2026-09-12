@@ -15,13 +15,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from garmin_client import get_client
+from garmin_client import get_client, get_tokenstore
+from shared_config import INTERNAL_LOGIN_PATH
 
 load_dotenv()
 
 mcp = MCPServer("garmin-activities")
-
-INTERNAL_LOGIN_PATH = "/internal/login"
 
 
 @mcp.tool()
@@ -29,7 +28,6 @@ def list_activities(limit: int = 5) -> list[dict]:
     """Devuelve las últimas actividades registradas en Garmin Connect."""
     client = get_client()
     activities = client.get_activities(0, limit)
-    assert isinstance(activities, list)
 
     return [
         {
@@ -66,27 +64,19 @@ def get_activity_detail(activity_id: int) -> dict:
 
 @mcp.custom_route(INTERNAL_LOGIN_PATH, methods=["POST"])
 async def internal_login(request: Request) -> JSONResponse:
-    """Cambia la cuenta de Garmin activa: hace un login real con las credenciales
-    recibidas y, solo si tiene éxito, sustituye la sesión cacheada por la nueva, para
-    que las siguientes llamadas a las herramientas (que reutilizan esa caché vía
-    get_client()) sirvan esta cuenta. Si el login falla, la sesión existente se deja
-    intacta.
-
-    El login se hace primero en un directorio temporal (vacío, así que
-    garminconnect no puede reutilizar ningún token cacheado y siempre autentica de
-    verdad) para no arriesgar la sesión ya cacheada mientras se verifican las
-    credenciales nuevas.
-
-    Pensado para ser llamado únicamente por la web de conexión (connector_web.py),
-    nunca directamente por clientes MCP. Protegido en BearerTokenMiddleware con un
-    secreto distinto (INTERNAL_LOGIN_TOKEN) al que usan los clientes MCP normales."""
+    """Cambia la cuenta de Garmin activa para get_client(): hace login con las
+    credenciales recibidas en un directorio temporal (así garminconnect no puede
+    reutilizar ningún token cacheado y autentica de verdad) y solo si tiene éxito
+    sustituye la sesión cacheada real por la nueva — un intento fallido no deja el
+    MCP sin sesión utilizable. Llamado únicamente por connector_web.py, con un
+    secreto distinto (INTERNAL_LOGIN_TOKEN) al de los clientes MCP normales."""
     body = await request.json()
     email = body.get("email")
     password = body.get("password")
-    if not email or not password:
+    if not isinstance(email, str) or not isinstance(password, str) or not email or not password:
         return JSONResponse({"error": "email and password are required"}, status_code=400)
 
-    tokenstore = os.getenv("GARMIN_TOKENSTORE", os.path.expanduser("~/.garminconnect"))
+    tokenstore = get_tokenstore()
     final_token_path = token_file_path(tokenstore)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
