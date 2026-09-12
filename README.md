@@ -1,9 +1,6 @@
-# Garmin Activities
+# Garmin MCP Server
 
-Programas en Python para consultar tus últimas actividades de Garmin Connect, usando la librería no oficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect). Incluye:
-
-- Un script de terminal (`garmin_activities.py`).
-- Un servidor MCP (`mcp_server.py`) que expone la misma consulta como herramienta para Claude — en local (`stdio`) o desplegado como servicio remoto con URL pública (HTTP).
+Servidor MCP en Python que expone tus últimas actividades de Garmin Connect como herramienta para Claude, usando la librería no oficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) — en local (`stdio`) o desplegado como servicio remoto con URL pública (HTTP).
 
 ## Requisitos
 
@@ -42,15 +39,6 @@ En el primer login exitoso, la librería guarda un token de sesión (por defecto
 
 ## Uso
 
-### Script de terminal
-
-```bash
-source venv/bin/activate
-python garmin_activities.py
-```
-
-Imprime las 5 actividades más recientes (fecha y nombre).
-
 ### Servidor MCP en local
 
 ```bash
@@ -74,19 +62,15 @@ El acceso está protegido con una clave compartida (`MCP_AUTH_TOKEN`), que el cl
 
 ## Despliegue en Railway
 
-El proyecto se despliega como dos servicios independientes dentro del mismo proyecto de Railway:
+El proyecto se despliega como servicio web (`mcp_server.py`) con dominio público, `MCP_TRANSPORT=http`.
 
-- **Cron diario** (`garmin_activities.py`): tipo *Cron Job*, sin URL, corre según una programación (`cronSchedule`) y termina — no se reinicia en bucle (`restartPolicyType: NEVER`).
-- **Servidor MCP remoto** (`mcp_server.py`): servicio web normal con dominio público, `MCP_TRANSPORT=http`.
-
-Ambos servicios necesitan un volumen persistente montado (p. ej. en `/data`) con `GARMIN_TOKENSTORE` apuntando a él — el filesystem de Railway es efímero, así que sin volumen cada ejecución reautenticaría con usuario/contraseña, aumentando el riesgo de bloqueo por rate limiting.
+Necesita un volumen persistente montado (p. ej. en `/data`) con `GARMIN_TOKENSTORE` apuntando a él — el filesystem de Railway es efímero, así que sin volumen cada ejecución reautenticaría con usuario/contraseña, aumentando el riesgo de bloqueo por rate limiting.
 
 ## Estructura del proyecto
 
 ```
 .
-├── garmin_activities.py   # script de terminal / cron
-├── garmin_client.py       # login a Garmin compartido por ambos programas
+├── garmin_client.py       # login a Garmin
 ├── mcp_server.py          # servidor MCP (local stdio / remoto HTTP)
 ├── requirements.txt       # dependencias con versiones fijadas
 ├── .env.example            # plantilla de variables de entorno
