@@ -1,4 +1,4 @@
-# Garmin MCP Server
+# LaIA
 
 Servidor MCP en Python que expone tus últimas actividades de Garmin Connect como herramienta para Claude, usando la librería no oficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) — en local (`stdio`) o desplegado como servicio remoto con URL pública (HTTP). Incluye una web de conexión (`connector_web.py`) para obtener esa URL sin tener que copiarla a mano.
 
@@ -45,7 +45,7 @@ En el primer login exitoso, la librería guarda un token de sesión (por defecto
 ### Servidor MCP en local
 
 ```bash
-claude mcp add garmin-activities -- "$(pwd)/venv/bin/python" "$(pwd)/mcp_server.py"
+claude mcp add laia -- "$(pwd)/venv/bin/python" "$(pwd)/mcp_server.py"
 ```
 
 Registra el servidor en Claude Code (modo `stdio`). Expone dos herramientas que Claude puede invocar directamente en el chat:
@@ -104,8 +104,10 @@ ambos con dominio público:
   usuario/contraseña, aumentando el riesgo de bloqueo por rate limiting.
 - **`connector_web.py`**: sin volumen (no cachea nada). Sus variables
   `MCP_AUTH_TOKEN` e `INTERNAL_LOGIN_TOKEN` se configuran como referencias a las del
-  servicio anterior (`${{garmin-mcp-server.MCP_AUTH_TOKEN}}`, etc.) para no duplicar
+  servicio anterior (`${{laia-mcp-server.MCP_AUTH_TOKEN}}`, etc.) para no duplicar
   los secretos.
+
+Los dos servicios en Railway se llaman `laia-mcp-server` y `laia-connector-web`.
 
 ## Estructura del proyecto
 
