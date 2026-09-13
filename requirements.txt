@@ -1,5 +1,9 @@
-# Cliente no oficial de la API de Garmin Connect
-garminconnect==0.3.11
+# Cliente no oficial de la API de Garmin Connect. Extras "workout" y "typed"
+# porque training_data.py/workout_builder.py usan garminconnect.typed (respuestas
+# validadas con Pydantic) y garminconnect.workout (modelos tipados para subir
+# entrenamientos estructurados) — sin esto pydantic solo llegaría de rebote vía
+# mcp, una dependencia transitiva de la que no deberíamos depender.
+garminconnect[workout,typed]==0.3.11
 
 # Carga variables desde el fichero .env
 python-dotenv==1.2.3

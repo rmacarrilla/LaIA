@@ -10,6 +10,7 @@ import os
 
 from dotenv import load_dotenv
 from mcp.server.auth.middleware.auth_context import get_access_token
+from pydantic import AnyHttpUrl
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
@@ -17,6 +18,8 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 import db
 import garmin_client
+import training_data
+import workout_builder
 from oauth_provider import FlowExpiredError, GarminOAuthProvider
 from rate_limit import RateLimiter, RateLimitMiddleware
 
@@ -31,8 +34,8 @@ mcp = MCPServer(
     "laia",
     auth_server_provider=_provider,
     auth=AuthSettings(
-        issuer_url=_issuer_url,
-        resource_server_url=f"{_issuer_url}/mcp",
+        issuer_url=AnyHttpUrl(_issuer_url),
+        resource_server_url=AnyHttpUrl(f"{_issuer_url}/mcp"),
         client_registration_options=ClientRegistrationOptions(
             enabled=True, valid_scopes=["activities"], default_scopes=["activities"]
         ),
@@ -61,28 +64,45 @@ async def _client_for_current_user() -> garmin_client.Garmin:
 
 
 @mcp.tool()
-async def list_activities(limit: int = 5) -> list[dict]:
-    """Devuelve las últimas actividades registradas en Garmin Connect."""
+async def get_training_snapshot(days: int = 7) -> dict:
+    """Resumen de fisiología (HRV, sueño, FC en reposo, body battery, estrés,
+    training readiness) y de la carga de entrenamiento de los últimos `days`
+    días. Punto de partida para evaluar cómo está el atleta antes de
+    planificar o re-planificar."""
     client = await _client_for_current_user()
-    activities = await asyncio.to_thread(client.get_activities, 0, limit)
+    return await training_data.training_snapshot(client, days)
 
-    return [
-        {
-            "activity_id": activity["activityId"],
-            "date": activity["startTimeLocal"],
-            "name": activity["activityName"],
-        }
-        for activity in activities
-    ]
+
+@mcp.tool()
+async def get_performance_profile() -> dict:
+    """Capacidad actual del atleta (FTP ciclista, umbral de carrera, zonas de FC
+    y potencia, VO2max, récords personales, predicciones de carrera, estado de
+    forma). Cambia poco de una llamada a otra — úsalo para fijar objetivos de
+    intensidad correctos al generar entrenamientos con create_workout."""
+    client = await _client_for_current_user()
+    return await training_data.performance_profile(client)
+
+
+@mcp.tool()
+async def get_calendar(start_date: str, end_date: str) -> dict:
+    """Cruza lo agendado en el calendario de Garmin con lo realmente entrenado
+    entre start_date y end_date (formato YYYY-MM-DD). Sirve para evaluar
+    (planificado vs. realizado) y para re-planificar (ver huecos o qué queda
+    por agendar)."""
+    client = await _client_for_current_user()
+    return await training_data.calendar(client, start_date, end_date)
 
 
 @mcp.tool()
 async def get_activity_detail(activity_id: int) -> dict:
     """Devuelve el detalle de una actividad de Garmin Connect (duración, distancia,
-    calorías, frecuencia cardíaca, velocidad media y desnivel). El activity_id se
-    obtiene de list_activities."""
+    calorías, frecuencia cardíaca, velocidad media, desnivel y splits por tramo).
+    El activity_id se obtiene de get_training_snapshot o get_calendar."""
     client = await _client_for_current_user()
-    activity = await asyncio.to_thread(client.get_activity, str(activity_id))
+    activity, splits = await asyncio.gather(
+        asyncio.to_thread(client.get_activity, str(activity_id)),
+        asyncio.to_thread(client.get_activity_splits, str(activity_id)),
+    )
     summary = activity["summaryDTO"]
 
     return {
@@ -96,7 +116,50 @@ async def get_activity_detail(activity_id: int) -> dict:
         "max_hr": summary.get("maxHR"),
         "average_speed_mps": summary.get("averageSpeed"),
         "elevation_gain_meters": summary.get("elevationGain"),
+        "splits": splits,
     }
+
+
+@mcp.tool()
+async def create_workout(sport: str, name: str, steps: list[dict]) -> dict:
+    """Crea (sube a la librería de entrenamientos de Garmin) un entrenamiento
+    estructurado por intervalos, sin agendarlo todavía — usa schedule_workout
+    para ponerlo en una fecha del calendario.
+
+    sport: "running" | "cycling" | "swimming" | "strength".
+
+    steps: lista de pasos, cada uno un dict con "kind":
+      - "warmup" | "cooldown" | "recovery": {"kind": ..., "duration_seconds": N}
+      - "interval": {"kind": "interval", "duration_seconds": N} o
+        {"kind": "interval", "distance_meters": N}
+      - "repeat": {"kind": "repeat", "count": N, "steps": [...]} (anidado)
+      - "strength_set" (solo sport="strength"):
+        {"kind": "strength_set", "category": "BENCH_PRESS", "sets": N,
+         "reps": N, "rest_seconds": N, "exercise_name": "" , "weight_kg": N}
+
+    Primera versión sin objetivo de zona (FC/ritmo/potencia) por tramo — solo
+    estructura por tiempo/distancia."""
+    client = await _client_for_current_user()
+    return await asyncio.to_thread(workout_builder.upload_workout, client, sport, name, steps)
+
+
+@mcp.tool()
+async def schedule_workout(workout_id: int, date: str) -> dict:
+    """Agenda en el calendario de Garmin, en la fecha dada (YYYY-MM-DD), un
+    entrenamiento ya creado con create_workout. Se puede llamar varias veces
+    con el mismo workout_id para repetir la misma sesión en distintas fechas."""
+    client = await _client_for_current_user()
+    return await asyncio.to_thread(client.schedule_workout, workout_id, date)
+
+
+@mcp.tool()
+async def remove_scheduled_workout(scheduled_workout_id: int) -> dict:
+    """Quita del calendario de Garmin un entrenamiento agendado (sin borrar la
+    plantilla de la librería de entrenamientos) — para re-planificar cuando
+    cambia el plan. El scheduled_workout_id se obtiene de get_calendar."""
+    client = await _client_for_current_user()
+    result = await asyncio.to_thread(client.unschedule_workout, scheduled_workout_id)
+    return {"result": result}
 
 
 PAGE_STYLE = """

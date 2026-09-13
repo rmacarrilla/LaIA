@@ -57,7 +57,7 @@ async def connect(database_url: str) -> None:
         await conn.execute(_FINALIZE_SCHEMA)
 
 
-async def _migrate_legacy_rows(conn: asyncpg.Connection) -> None:
+async def _migrate_legacy_rows(conn: asyncpg.pool.PoolConnectionProxy) -> None:
     """Rellena garmin_email_hash/session_blob_encrypted a partir de las columnas
     en claro de una versión anterior de este proyecto (antes de cifrar PII), si
     todavía existen. Idempotente: no hace nada si ya no hay columnas legacy."""

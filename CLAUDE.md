@@ -75,18 +75,46 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
   `/token` — no hay que reimplementar nada de eso.
 - **`mcp_server.py`**: construye `MCPServer("laia", auth_server_provider=...,
   auth=AuthSettings(...))` — con eso el SDK monta solo todas las rutas OAuth.
-  Las tools (`list_activities`, `get_activity_detail`) son `async def` (antes no
-  lo eran) porque necesitan `await` para leer la sesión de Postgres. Esto tiene
-  una trampa: el framework MCP solo despacha a un hilo las tools **síncronas**
-  (`anyio.to_thread.run_sync`, confirmado leyendo
+  Las tools son `async def` porque necesitan `await` para leer la sesión de
+  Postgres. Esto tiene una trampa: el framework MCP solo despacha a un hilo
+  las tools **síncronas** (`anyio.to_thread.run_sync`, confirmado leyendo
   `mcp/server/mcpserver/utilities/func_metadata.py`); una tool `async def` se
   ejecuta directamente en el event loop, así que las llamadas bloqueantes
-  dentro (`client.get_activities(...)`, reconstruir el cliente desde el blob)
+  dentro (métodos de `garminconnect`, reconstruir el cliente desde el blob)
   hay que envolverlas explícitamente en `asyncio.to_thread` — si no, se
   reintroduce el mismo bug de bloquear el servidor entero que ya se corrigió una
   vez en la versión anterior (monousuario) de `internal_login`. La ruta
   `/login` (GET muestra el formulario, POST lo procesa) es pública a propósito
   — es la puerta de entrada, no puede exigir un token que aún no existe.
+- **Tools organizadas por workflow de coaching, no por método de
+  `garminconnect`**: la librería expone ~150 métodos; envolver cada uno 1:1
+  habría hecho perder de vista para qué sirve cada llamada y habría disparado
+  el consumo de tokens si alguna tool devolviera una respuesta punto a punto
+  (FC/potencia por segundo, sueño minuto a minuto, body battery intradía).
+  En su lugar hay 7 tools pensadas para un modelo que hace de entrenador
+  experto en triatlón — planificar, evaluar, re-planificar, generar
+  entrenamientos y agendarlos — cada una devolviendo ya un resumen:
+  - **Lectura** (`training_data.py`): `get_training_snapshot` (fisiología +
+    carga reciente, usando `client.typed` — namespace Pydantic que trae la
+    propia librería — para no adivinar claves de un dict crudo),
+    `get_performance_profile` (FTP, zonas, VO2max, récords... datos que
+    cambian poco, para fijar objetivos de intensidad) y `get_calendar`
+    (cruza lo agendado en Garmin con lo realmente entrenado en un rango, para
+    evaluar y re-planificar). `get_activity_detail` (en `mcp_server.py`) se
+    queda para el detalle de una sesión concreta.
+  - **Escritura** (`workout_builder.py`): `create_workout` (sube una
+    plantilla estructurada — nadar/bici/correr/fuerza — a partir de un
+    esquema JSON genérico de pasos, usando los modelos Pydantic tipados que
+    ya trae `garminconnect.workout`), `schedule_workout` y
+    `remove_scheduled_workout` (agendar/desagendar esa plantilla en el
+    calendario, separado de crearla para poder reutilizar la misma sesión en
+    varias fechas sin recrearla).
+  - **Pendiente**: `create_workout` construye pasos por tiempo/distancia sin
+    target de zona (FC/ritmo/potencia) — la librería no trae helper para eso
+    y Garmin no documenta el shape exacto del dict de target con zona (API no
+    oficial). Antes de añadirlo hay que verificarlo contra un entrenamiento
+    real: crearlo a mano en la app de Garmin y leer su JSON con
+    `get_workout_by_id`.
 - **Identidad de quien llama**: dentro de una tool,
   `mcp.server.auth.middleware.auth_context.get_access_token()` devuelve el
   `AccessToken` validado de la petición en curso; `.subject` es el `user_id` de
