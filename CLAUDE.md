@@ -107,6 +107,35 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
 - **Arranque**: `_connect_db_with_retry` reintenta con backoff exponencial si
   Postgres no responde a la primera (p.ej. una carrera de arranque con el
   propio plugin de Postgres en Railway), en vez de morir directamente.
+- **Canje de código atómico**: `db.delete_object` devuelve si de verdad borró
+  algo. `exchange_authorization_code` lo comprueba y lanza `TokenError` si no
+  — sin esto, dos canjes concurrentes del mismo `authorization_code` (el
+  `load_authorization_code` del SDK y nuestro `delete_object` son dos
+  llamadas async separadas, no una transacción) podrían colarse ambos antes
+  de que ninguno viera el borrado del otro, emitiendo dos pares de tokens
+  desde un code que se supone de un solo uso.
+- **Mensajes de login genéricos**: `garminconnect` tiene mensajes de error
+  distintos según el motivo exacto del fallo (credenciales, cuenta
+  inexistente, MFA...). `complete_login`/`delete_account` nunca relanzan
+  `str(err)` tal cual al usuario — siempre un mensaje fijo — porque hacerlo
+  permitiría enumerar qué cuentas de Garmin existen de verdad.
+  `FlowExpiredError` es la excepción aparte para "el flow_id no existe",
+  que sí es información segura de mostrar (no depende de ninguna cuenta).
+- **`/account/delete`** (`oauth_provider.py`: `delete_account`): autoservicio
+  de borrado (GDPR art. 17). Reautentica con Garmin en vez de exigir un
+  access token — así solo quien sabe la contraseña puede borrar esa cuenta, y
+  no depende de si `get_access_token()` propaga la identidad a rutas fuera de
+  `/mcp` (no lo comprobamos, así que no construimos la ruta sobre esa
+  suposición). `db.delete_user` borra la fila de `users` y, filtrando por
+  `data->>'subject'` en el JSONB, sus tokens de `oauth_objects` — esas dos
+  tablas no comparten una clave foránea real, el `subject` vive dentro del
+  JSON, no en una columna propia.
+- **Rate limiting por (método, ruta)**, no solo por ruta: `RateLimitMiddleware`
+  distingue `GET /login` (ver el formulario) de `POST /login` (intentar
+  autenticar), para que lo primero no consuma el cupo de lo segundo.
+  `GET /authorize` también está limitado — con cualquier `client_id` válido
+  (trivial de conseguir, `/register` es público) se podían generar
+  `pending_authorize` sin límite si solo se cubría `/register`.
 
 ## Historia relevante
 

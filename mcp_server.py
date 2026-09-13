@@ -17,7 +17,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 import db
 import garmin_client
-from oauth_provider import GarminOAuthProvider
+from oauth_provider import FlowExpiredError, GarminOAuthProvider
 from rate_limit import RateLimiter, RateLimitMiddleware
 
 load_dotenv()
@@ -184,10 +184,55 @@ async def login_submit(request: Request) -> Response:
 
     try:
         redirect_url = await _provider.complete_login(flow_id, email, password)
+    except FlowExpiredError:
+        # El flow_id ya no existe: reintentar en el mismo formulario no sirve
+        # de nada (nunca llegará a un redirect_uri válido), así que se trata
+        # igual que el GET con un flow inválido, no como un error de login.
+        return _page(
+            "<h1>Enlace caducado</h1><p>Vuelve a intentarlo desde Claude.</p>", status_code=400
+        )
     except RuntimeError as err:
         return _login_form(flow_id, await _client_label_for_flow(flow_id), error=str(err))
 
     return RedirectResponse(url=redirect_url, status_code=302)
+
+
+@mcp.custom_route("/account/delete", methods=["GET", "POST"])
+async def account_delete(request: Request) -> Response:
+    """Autoservicio de borrado de cuenta (derecho al olvido). Reautentica con
+    Garmin en vez de exigir un access token: así solo quien sabe la
+    contraseña puede borrar esa cuenta, y no hace falta que este endpoint
+    dependa de cómo el SDK propaga la identidad a rutas fuera de /mcp."""
+    if request.method == "GET":
+        return _page("""<h1>Borrar tu cuenta de LaIA</h1>
+  <p>Esto borra tu sesión guardada y revoca todos los tokens de acceso
+     emitidos a nombre de tu cuenta de Garmin. No se puede deshacer.</p>
+  <form method="post" action="/account/delete">
+    <label>Email
+      <input type="email" name="email" required>
+    </label>
+    <label>Contraseña
+      <input type="password" name="password" required>
+    </label>
+    <button type="submit">Borrar mi cuenta</button>
+  </form>""")
+
+    form = await request.form()
+    email = str(form.get("email", ""))
+    password = str(form.get("password", ""))
+
+    try:
+        await _provider.delete_account(email, password)
+    except RuntimeError:
+        # Mensaje fijo, nunca el texto del error de Garmin: mismo motivo que
+        # en /login, evita filtrar si una cuenta existe o no.
+        return _page(
+            '<h1>No se pudo verificar tu cuenta</h1>'
+            '<p><a href="/account/delete">Volver a intentarlo</a></p>',
+            status_code=400,
+        )
+
+    return _page("<h1>Cuenta borrada</h1><p>Ya no quedan datos tuyos en LaIA.</p>")
 
 
 async def _connect_db_with_retry(database_url: str, attempts: int = 5) -> None:
@@ -249,12 +294,18 @@ if __name__ == "__main__":
             app.add_middleware(
                 RateLimitMiddleware,
                 limiters={
-                    # /login: fuerza bruta de credenciales de Garmin.
-                    "/login": RateLimiter(max_requests=10, window_seconds=900),
+                    # /login y /account/delete: fuerza bruta de credenciales
+                    # de Garmin (ambas terminan llamando a garmin_client.login).
+                    ("POST", "/login"): RateLimiter(max_requests=10, window_seconds=900),
+                    ("POST", "/account/delete"): RateLimiter(max_requests=10, window_seconds=900),
                     # /register: alta de clientes OAuth, sin autenticación previa
                     # por diseño (RFC 7591) y sin caducidad — limitar el ritmo
                     # evita que se llene la tabla de golpe.
-                    "/register": RateLimiter(max_requests=20, window_seconds=3600),
+                    ("POST", "/register"): RateLimiter(max_requests=20, window_seconds=3600),
+                    # /authorize (GET): con cualquier client_id válido (fácil de
+                    # conseguir, /register es público) se pueden generar
+                    # pending_authorize sin límite si esto no se cubre aparte.
+                    ("GET", "/authorize"): RateLimiter(max_requests=20, window_seconds=900),
                 },
             )
 

@@ -15,6 +15,7 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     OAuthAuthorizationServerProvider,
     RefreshToken,
+    TokenError,
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
@@ -26,6 +27,11 @@ import garmin_client
 ACCESS_TOKEN_TTL_SECONDS = 3600
 AUTH_CODE_TTL_SECONDS = 600  # tiempo para rellenar el formulario de login
 LOGIN_FLOW_TTL_SECONDS = 600
+
+
+class FlowExpiredError(RuntimeError):
+    """El flow_id no existe o caducó — a diferencia de un login de Garmin
+    rechazado, esto no es sensible: no hace falta un mensaje genérico."""
 
 
 class PendingAuthorization(BaseModel):
@@ -64,17 +70,26 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     async def complete_login(self, flow_id: str, email: str, password: str) -> str:
         """Verifica las credenciales de Garmin y, si son válidas, termina el
         flujo OAuth: da de alta (o actualiza) el usuario, emite un authorization
-        code y devuelve la URL a la que redirigir de vuelta a Claude. Lanza
-        RuntimeError si el login de Garmin falla (mismo tipo de error que
-        garmin_client.login(), para que la ruta lo muestre igual)."""
+        code y devuelve la URL a la que redirigir de vuelta a Claude.
+
+        Lanza FlowExpiredError si el flow_id no existe/caducó, o RuntimeError
+        (mensaje genérico) si Garmin rechaza las credenciales."""
         pending = await self.load_pending_authorization(flow_id)
         if pending is None:
-            raise RuntimeError("Este enlace de conexión ha caducado. Vuelve a intentarlo desde Claude.")
+            raise FlowExpiredError("Este enlace de conexión ha caducado. Vuelve a intentarlo desde Claude.")
 
         # garmin_client.login() es una llamada de red bloqueante (10-20s de espera
         # anti-bot deliberada de Garmin) y esto es una corrutina: sin to_thread
         # bloquearía el event loop entero para cualquier otra petición concurrente.
-        session_blob = await asyncio.to_thread(garmin_client.login, email, password)
+        try:
+            session_blob = await asyncio.to_thread(garmin_client.login, email, password)
+        except RuntimeError as err:
+            # Nunca relanzar str(err) tal cual: garminconnect usa mensajes
+            # distintos según el motivo exacto del fallo (credenciales
+            # incorrectas, cuenta inexistente, MFA, ...), y reenviarlos al
+            # usuario permitiría enumerar qué cuentas de Garmin existen.
+            raise RuntimeError("No se pudo verificar tu email y contraseña de Garmin.") from err
+
         user_id = await db.upsert_user(email, session_blob)
 
         code = AuthorizationCode(
@@ -101,7 +116,15 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        await db.delete_object("code", authorization_code.code)  # un solo uso
+        # El SDK ya validó el code (existe, no caducado, PKCE correcto) con un
+        # load_authorization_code() previo — pero entre ese load y este delete
+        # otra petición concurrente con el mismo code podría colarse. Que
+        # delete_object confirme que de verdad borró algo hace el canje
+        # atómico: solo quien gana la carrera por borrar la fila recibe
+        # tokens (RFC 6749 §10.5: un code reutilizado se trata como inválido).
+        consumed = await db.delete_object("code", authorization_code.code)
+        if not consumed:
+            raise TokenError(error="invalid_grant", error_description="authorization code already used")
         return await self._issue_tokens(client.client_id, authorization_code.scopes, authorization_code.subject)
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
@@ -119,6 +142,19 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         kind = "access" if isinstance(token, AccessToken) else "refresh"
         await db.delete_object(kind, token.token)
+
+    async def delete_account(self, email: str, password: str) -> None:
+        """Reautentica contra Garmin (mismo nivel de confianza que /login) y
+        borra la cuenta y todos sus tokens — derecho al olvido, autoservicio.
+        Reautenticar en vez de fiarse de un access token evita que alguien
+        borre la cuenta de otra persona con solo conocer su user_id."""
+        await asyncio.to_thread(garmin_client.login, email, password)  # lanza RuntimeError si falla
+
+        user_id = await db.get_user_id_by_email(email)
+        if user_id is None:
+            return  # login válido pero nunca se registró en LaIA: nada que borrar
+
+        await db.delete_user(user_id)
 
     async def _issue_tokens(self, client_id: str, scopes: list[str], subject: str | None) -> OAuthToken:
         access = AccessToken(

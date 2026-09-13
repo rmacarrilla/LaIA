@@ -149,8 +149,35 @@ async def load_object(kind: str, key: str, model_cls: type[BaseModel]) -> BaseMo
     return model_cls.model_validate_json(row["data"])
 
 
-async def delete_object(kind: str, key: str) -> None:
-    await _pool_or_raise().execute("DELETE FROM oauth_objects WHERE kind = $1 AND key = $2", kind, key)
+async def delete_object(kind: str, key: str) -> bool:
+    """Devuelve True si había una fila y se borró, False si ya no existía —
+    permite detectar el canje/uso concurrente de un mismo objeto de un solo
+    uso (p.ej. un authorization code) en vez de asumir a ciegas que el borrado
+    de esta llamada fue el único."""
+    result = await _pool_or_raise().execute("DELETE FROM oauth_objects WHERE kind = $1 AND key = $2", kind, key)
+    return result != "DELETE 0"
+
+
+async def get_user_id_by_email(garmin_email: str) -> int | None:
+    row = await _pool_or_raise().fetchrow(
+        "SELECT id FROM users WHERE garmin_email_hash = $1", crypto_utils.hash_email(garmin_email)
+    )
+    return row["id"] if row else None
+
+
+async def delete_user(user_id: int) -> None:
+    """Borra la cuenta y sus tokens de acceso/refresco (derecho al olvido).
+    access/refresh no tienen su propia columna de subject indexada — viven
+    dentro del JSONB de oauth_objects — así que se filtran por ahí; a este
+    tamaño de tabla (limpiada cada hora por purge_expired_objects) no hace
+    falta un índice para esa consulta."""
+    async with _pool_or_raise().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+            await conn.execute(
+                "DELETE FROM oauth_objects WHERE kind IN ('access', 'refresh') AND data->>'subject' = $1",
+                str(user_id),
+            )
 
 
 async def purge_expired_objects() -> int:

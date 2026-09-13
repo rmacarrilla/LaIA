@@ -108,12 +108,23 @@ primera vez que se conecta — no hay migraciones que ejecutar a mano. Dos tabla
   pidiendo acceso (`client_name` del cliente OAuth registrado) — sin esto,
   cualquiera podría registrar su propio cliente y enviar un enlace a nuestra
   pantalla de login real para phishear credenciales de Garmin.
-- **Rate limiting**: `/login` (fuerza bruta de credenciales) y `/register`
-  (alta de clientes OAuth, abierta por diseño y sin caducidad) están
-  limitados por IP en memoria (`rate_limit.py`) — suficiente para uso
-  personal/small-scale, no sustituye un WAF si esto creciera de verdad.
+- **Rate limiting**: `POST /login`, `POST /account/delete`, `POST /register`
+  y `GET /authorize` están limitados por IP en memoria (`rate_limit.py`,
+  por (método, ruta) — así ver un formulario no consume el mismo cupo que
+  enviarlo) — suficiente para uso personal/small-scale, no sustituye un WAF
+  si esto creciera de verdad.
 - **PII y credenciales**: nunca en claro en Postgres (ver `crypto_utils.py`).
-  Ni el email ni la contraseña de Garmin se registran jamás en logs.
+  Ni el email ni la contraseña de Garmin se registran jamás en logs. Los
+  mensajes de error de login (`/login`, `/account/delete`) son siempre
+  genéricos de cara al usuario, para no filtrar por qué falló exactamente
+  (evita enumerar qué cuentas de Garmin existen).
+- **Autorización de código de un solo uso**: `exchange_authorization_code`
+  confirma que de verdad borró el code (no solo que lo leyó) antes de emitir
+  tokens — dos canjes concurrentes del mismo code no pueden emitir dos pares
+  de tokens.
+- **Borrado de cuenta**: `GET/POST /account/delete` — reautentica con Garmin
+  (igual que `/login`) y borra la fila de `users` y sus tokens de acceso/
+  refresco. Autoservicio real, no un borrado manual en la base de datos.
 
 ## Despliegue en Railway
 
@@ -140,10 +151,18 @@ en la base de datos, no en el filesystem.
 
 ## Limitaciones conocidas
 
-- Sin autoservicio de borrado de cuenta todavía (derecho al olvido / GDPR
-  art. 17) — hoy habría que borrar la fila a mano en `users`.
 - El rate limiting es en memoria de un solo proceso: no protege de un ataque
-  distribuido de verdad ni se comparte entre réplicas.
+  distribuido de verdad ni se comparte entre réplicas (hoy el servicio corre
+  con una única réplica en Railway, así que protege de verdad).
+- Sin rotación de `SESSION_ENCRYPTION_KEY` — aceptable mientras el número de
+  usuarios reales sea pequeño; reconsiderar (reencriptado por lotes) a partir
+  de unas 20-30 cuentas.
+- Sin tests automáticos ni CI — cualquier regresión llega a producción sin
+  red de seguridad automática.
+- `/register` es público y sin caducidad por diseño (RFC 7591 / Dynamic
+  Client Registration) — mitigado con rate limiting, pero cualquiera puede
+  registrar un `client_name` engañoso; la pantalla de consentimiento avisa,
+  pero no hay verificación de identidad de clientes.
 
 ## Licencia
 
