@@ -195,10 +195,12 @@ def _login_form(flow_id: str, client_label: str, error: str | None = None) -> HT
     safe_client_label = html.escape(client_label)
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     return _page(f"""<h1>Conectar tu Garmin con Claude</h1>
-  <p><strong>{safe_client_label}</strong> solicita acceso a tus actividades y datos
-     de entrenamiento de Garmin Connect (nombre, fecha, duración, distancia,
-     frecuencia cardíaca y similares). Solo continúa si reconoces y confías en
-     esta aplicación.</p>
+  <p><strong>{safe_client_label}</strong> solicita acceso a tu cuenta de Garmin
+     Connect. Podrá <strong>leer</strong> tus actividades y métricas de
+     entrenamiento y fisiología (frecuencia cardíaca, sueño, HRV y similares),
+     y también <strong>crear, agendar y borrar entrenamientos</strong> en tu
+     calendario de Garmin. Solo continúa si reconoces y confías en esta
+     aplicación.</p>
   <p>Introduce tu email y contraseña de Garmin Connect para autorizar el acceso:</p>
   {error_html}
   <form method="post" action="/login">
@@ -369,6 +371,11 @@ if __name__ == "__main__":
                     # conseguir, /register es público) se pueden generar
                     # pending_authorize sin límite si esto no se cubre aparte.
                     ("GET", "/authorize"): RateLimiter(max_requests=20, window_seconds=900),
+                    # /mcp: red de seguridad basta (por IP, no por token) contra un
+                    # bucle descontrolado de tool calls — algunas (get_training_snapshot,
+                    # get_calendar) disparan decenas de llamadas a Garmin cada una: sin
+                    # esto, nada limita cuántas veces se repiten por minuto.
+                    ("POST", "/mcp"): RateLimiter(max_requests=60, window_seconds=60),
                 },
             )
 

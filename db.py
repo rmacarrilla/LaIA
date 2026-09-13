@@ -166,16 +166,17 @@ async def get_user_id_by_email(garmin_email: str) -> int | None:
 
 
 async def delete_user(user_id: int) -> None:
-    """Borra la cuenta y sus tokens de acceso/refresco (derecho al olvido).
-    access/refresh no tienen su propia columna de subject indexada — viven
-    dentro del JSONB de oauth_objects — así que se filtran por ahí; a este
-    tamaño de tabla (limpiada cada hora por purge_expired_objects) no hace
-    falta un índice para esa consulta."""
+    """Borra la cuenta y sus tokens de acceso/refresco, y cualquier
+    authorization code emitido a su nombre que aún no se haya canjeado
+    (derecho al olvido). Ninguno de los tres tiene su propia columna de
+    subject indexada — viven dentro del JSONB de oauth_objects — así que se
+    filtran por ahí; a este tamaño de tabla (limpiada cada hora por
+    purge_expired_objects) no hace falta un índice para esa consulta."""
     async with _pool_or_raise().acquire() as conn:
         async with conn.transaction():
             await conn.execute("DELETE FROM users WHERE id = $1", user_id)
             await conn.execute(
-                "DELETE FROM oauth_objects WHERE kind IN ('access', 'refresh') AND data->>'subject' = $1",
+                "DELETE FROM oauth_objects WHERE kind IN ('access', 'refresh', 'code') AND data->>'subject' = $1",
                 str(user_id),
             )
 

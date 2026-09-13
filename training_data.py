@@ -55,6 +55,9 @@ async def training_snapshot(client: Garmin, days: int = 7) -> dict[str, Any]:
     """Resumen de fisiología (HRV, sueño, FC en reposo, body battery, estrés,
     training readiness) y de la carga de entrenamiento reciente, para que el
     modelo evalúe cómo está el atleta antes de planificar o re-planificar."""
+    if not 1 <= days <= 31:
+        raise ValueError("days debe estar entre 1 y 31")
+
     end = date.today()
     start = end - timedelta(days=days - 1)
     start_str, end_str = start.isoformat(), end.isoformat()
@@ -167,6 +170,9 @@ async def calendar(client: Garmin, start_date: str, end_date: str) -> dict[str, 
     fecha/deporte con `completed_activities`."""
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date)
+    if end < start or (end - start).days > 120:
+        raise ValueError("El rango debe ser start <= end y no superar 120 días")
+
     months = _months_between(start, end)
 
     scheduled_by_month, activities = await asyncio.gather(
