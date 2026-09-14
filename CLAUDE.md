@@ -91,7 +91,7 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
   habría hecho perder de vista para qué sirve cada llamada y habría disparado
   el consumo de tokens si alguna tool devolviera una respuesta punto a punto
   (FC/potencia por segundo, sueño minuto a minuto, body battery intradía).
-  En su lugar hay 7 tools pensadas para un modelo que hace de entrenador
+  En su lugar hay 8 tools pensadas para un modelo que hace de entrenador
   experto en triatlón — planificar, evaluar, re-planificar, generar
   entrenamientos y agendarlos — cada una devolviendo ya un resumen:
   - **Lectura** (`training_data.py`): `get_training_snapshot` (fisiología +
@@ -105,21 +105,30 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
   - **Escritura** (`workout_builder.py`): `create_workout` (sube una
     plantilla estructurada — nadar/bici/correr/fuerza — a partir de un
     esquema JSON genérico de pasos, usando los modelos Pydantic tipados que
-    ya trae `garminconnect.workout`), `schedule_workout` y
-    `remove_scheduled_workout`/`remove_scheduled_workouts` (agendar/desagendar
-    esa plantilla en el calendario, separado de crearla para poder reutilizar
-    la misma sesión en varias fechas sin recrearla). Importante: **desagendar
-    no es borrar** — `unschedule_workout` (lo que usan ambas tools de
-    "remove") solo quita la entrada del calendario; la plantilla sigue en la
-    librería de Garmin. `delete_workout` es la única que borra la plantilla
-    de verdad (`client.delete_workout`, ya la trae `garminconnect`, aquí solo
-    se envuelve). La versión en plural (`remove_scheduled_workouts(start_date,
-    end_date, exclude_ids)`) existe porque limpiar un calendario con decenas
-    de entradas una a una es inviable en una conversación — encuentra
-    candidatos con `training_data.find_scheduled_in_range` (que filtra
-    `calendarItems` por `itemType == "workout"`; ese endpoint de Garmin
-    también devuelve `"nap"`, `"activity"`, etc., que no son entrenamientos
-    agendados) y los desagenda en paralelo.
+    ya trae `garminconnect.workout`), `schedule_workout` (agenda esa
+    plantilla en el calendario, separado de crearla para poder reutilizar la
+    misma sesión en varias fechas sin recrearla), `unschedule_workouts` y
+    `delete_workouts`. Importante: **desagendar no es borrar** —
+    `unschedule_workout` (lo que usa `unschedule_workouts` por debajo) solo
+    quita la entrada del calendario; la plantilla sigue en la librería de
+    Garmin. `delete_workouts` es la única que borra la plantilla de verdad
+    (`client.delete_workout`, ya la trae `garminconnect`, aquí solo se
+    envuelve).
+    `unschedule_workouts` acepta dos modos mutuamente excluyentes,
+    validados en la propia tool (no expresables en el JSON Schema): por
+    `scheduled_workout_ids` explícitos (`workout_builder.unschedule_workouts_by_id`)
+    o por rango `start_date`/`end_date` con `exclude_ids` opcional
+    (`workout_builder.unschedule_workouts_in_range`, que encuentra
+    candidatos con `training_data.find_scheduled_in_range` — filtra
+    `calendarItems` por `itemType == "workout"`, ya que ese endpoint de
+    Garmin también devuelve `"nap"`, `"activity"`, etc. — y desagenda en
+    paralelo). `delete_workouts(workout_ids: list[int])` acepta también una
+    lista (un solo id es una lista de un elemento) para poder borrar varias
+    plantillas de golpe, igual que el modo rango de `unschedule_workouts`.
+    Ambas tools existían antes como pares singular/plural
+    (`remove_scheduled_workout`/`s`, `delete_workout`) — se fusionaron para
+    eliminar esa duplicación y, de paso, dar borrado en bloque también a
+    las plantillas (antes solo el calendario lo tenía).
   - **Pendiente**: `create_workout` construye pasos por tiempo/distancia sin
     target de zona (FC/ritmo/potencia) — la librería no trae helper para eso
     y Garmin no documenta el shape exacto del dict de target con zona (API no

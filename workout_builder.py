@@ -155,15 +155,16 @@ def upload_workout(client: Garmin, sport: str, name: str, steps: list[dict[str, 
     return {"workout_id": result.get("workoutId"), "name": result.get("workoutName", name)}
 
 
-async def remove_scheduled_workouts(
+async def unschedule_workouts_in_range(
     client: Garmin, start_date: str, end_date: str, exclude_ids: list[int]
 ) -> dict[str, Any]:
-    """Desagenda (nunca borra plantillas — usar delete_workout para eso) todo
+    """Desagenda (nunca borra plantillas — usar delete_workouts para eso) todo
     lo agendado en [start_date, end_date] salvo los scheduled_workout_id en
     exclude_ids. A diferencia de upload_workout (una sola llamada bloqueante),
     esta orquesta varias llamadas (encontrar candidatos + desagendar cada
     uno), así que es async — igual que training_data.find_scheduled_in_range,
-    del que depende."""
+    del que depende. Modo "rango" de la tool unschedule_workouts
+    (mcp_server.py); ver también unschedule_workouts_by_id para el modo "ids"."""
     exclude = set(exclude_ids)
     candidates = await training_data.find_scheduled_in_range(client, start_date, end_date)
     to_remove = [c for c in candidates if c["scheduled_workout_id"] not in exclude]
@@ -182,3 +183,29 @@ async def remove_scheduled_workouts(
         "failed_ids": failed,
         "excluded_ids": sorted(exclude & {c["scheduled_workout_id"] for c in candidates}),
     }
+
+
+async def unschedule_workouts_by_id(client: Garmin, scheduled_workout_ids: list[int]) -> dict[str, Any]:
+    """Desagenda en paralelo cada scheduled_workout_id dado explícitamente —
+    modo "ids" de unschedule_workouts (mcp_server.py), sin buscar candidatos
+    en el calendario (a diferencia de unschedule_workouts_in_range)."""
+    results = await asyncio.gather(
+        *(asyncio.to_thread(client.unschedule_workout, i) for i in scheduled_workout_ids),
+        return_exceptions=True,
+    )
+    removed = [i for i, r in zip(scheduled_workout_ids, results) if not isinstance(r, Exception)]
+    failed = [i for i, r in zip(scheduled_workout_ids, results) if isinstance(r, Exception)]
+    return {"removed_count": len(removed), "removed_ids": removed, "failed_ids": failed}
+
+
+async def delete_workouts(client: Garmin, workout_ids: list[int]) -> dict[str, Any]:
+    """Borra de verdad, en paralelo, cada plantilla de la librería de Garmin
+    dada en workout_ids — a diferencia de unschedule_workouts_by_id/_in_range,
+    que solo desagendan del calendario."""
+    results = await asyncio.gather(
+        *(asyncio.to_thread(client.delete_workout, i) for i in workout_ids),
+        return_exceptions=True,
+    )
+    deleted = [i for i, r in zip(workout_ids, results) if not isinstance(r, Exception)]
+    failed = [i for i, r in zip(workout_ids, results) if isinstance(r, Exception)]
+    return {"deleted_count": len(deleted), "deleted_ids": deleted, "failed_ids": failed}
