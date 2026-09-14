@@ -106,9 +106,20 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
     plantilla estructurada — nadar/bici/correr/fuerza — a partir de un
     esquema JSON genérico de pasos, usando los modelos Pydantic tipados que
     ya trae `garminconnect.workout`), `schedule_workout` y
-    `remove_scheduled_workout` (agendar/desagendar esa plantilla en el
-    calendario, separado de crearla para poder reutilizar la misma sesión en
-    varias fechas sin recrearla).
+    `remove_scheduled_workout`/`remove_scheduled_workouts` (agendar/desagendar
+    esa plantilla en el calendario, separado de crearla para poder reutilizar
+    la misma sesión en varias fechas sin recrearla). Importante: **desagendar
+    no es borrar** — `unschedule_workout` (lo que usan ambas tools de
+    "remove") solo quita la entrada del calendario; la plantilla sigue en la
+    librería de Garmin. `delete_workout` es la única que borra la plantilla
+    de verdad (`client.delete_workout`, ya la trae `garminconnect`, aquí solo
+    se envuelve). La versión en plural (`remove_scheduled_workouts(start_date,
+    end_date, exclude_ids)`) existe porque limpiar un calendario con decenas
+    de entradas una a una es inviable en una conversación — encuentra
+    candidatos con `training_data.find_scheduled_in_range` (que filtra
+    `calendarItems` por `itemType == "workout"`; ese endpoint de Garmin
+    también devuelve `"nap"`, `"activity"`, etc., que no son entrenamientos
+    agendados) y los desagenda en paralelo.
   - **Pendiente**: `create_workout` construye pasos por tiempo/distancia sin
     target de zona (FC/ritmo/potencia) — la librería no trae helper para eso
     y Garmin no documenta el shape exacto del dict de target con zona (API no

@@ -11,6 +11,7 @@ y leer su JSON con get_workout_by_id.
 
 from __future__ import annotations
 
+import asyncio
 from itertools import count
 from typing import Any
 
@@ -32,6 +33,8 @@ from garminconnect.workout import (
     create_strength_set,
     create_warmup_step,
 )
+
+import training_data
 
 _WORKOUT_CLASSES: dict[str, type[BaseWorkout]] = {
     "running": RunningWorkout,
@@ -150,3 +153,32 @@ def upload_workout(client: Garmin, sport: str, name: str, steps: list[dict[str, 
     upload = getattr(client, _UPLOAD_METHODS[sport])
     result = upload(workout)
     return {"workout_id": result.get("workoutId"), "name": result.get("workoutName", name)}
+
+
+async def remove_scheduled_workouts(
+    client: Garmin, start_date: str, end_date: str, exclude_ids: list[int]
+) -> dict[str, Any]:
+    """Desagenda (nunca borra plantillas — usar delete_workout para eso) todo
+    lo agendado en [start_date, end_date] salvo los scheduled_workout_id en
+    exclude_ids. A diferencia de upload_workout (una sola llamada bloqueante),
+    esta orquesta varias llamadas (encontrar candidatos + desagendar cada
+    uno), así que es async — igual que training_data.find_scheduled_in_range,
+    del que depende."""
+    exclude = set(exclude_ids)
+    candidates = await training_data.find_scheduled_in_range(client, start_date, end_date)
+    to_remove = [c for c in candidates if c["scheduled_workout_id"] not in exclude]
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(client.unschedule_workout, c["scheduled_workout_id"]) for c in to_remove),
+        return_exceptions=True,
+    )
+
+    removed = [c["scheduled_workout_id"] for c, r in zip(to_remove, results) if not isinstance(r, Exception)]
+    failed = [c["scheduled_workout_id"] for c, r in zip(to_remove, results) if isinstance(r, Exception)]
+
+    return {
+        "removed_count": len(removed),
+        "removed_ids": removed,
+        "failed_ids": failed,
+        "excluded_ids": sorted(exclude & {c["scheduled_workout_id"] for c in candidates}),
+    }

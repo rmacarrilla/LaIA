@@ -162,6 +162,32 @@ async def remove_scheduled_workout(scheduled_workout_id: int) -> dict:
     return {"result": result}
 
 
+@mcp.tool()
+async def remove_scheduled_workouts(
+    start_date: str, end_date: str, exclude_ids: list[int] | None = None
+) -> dict:
+    """Desagenda en bloque todo lo agendado en el calendario de Garmin entre
+    start_date y end_date (YYYY-MM-DD, inclusive; máximo 120 días) — sin
+    borrar plantillas de la librería, usa delete_workout para eso.
+    exclude_ids: scheduled_workout_id (los que da get_calendar) que NO se
+    deben tocar. Para limpiar o reorganizar un tramo del calendario sin una
+    llamada por entrada."""
+    client = await _client_for_current_user()
+    return await workout_builder.remove_scheduled_workouts(client, start_date, end_date, exclude_ids or [])
+
+
+@mcp.tool()
+async def delete_workout(workout_id: int) -> dict:
+    """Borra de verdad una plantilla de la librería de entrenamientos de
+    Garmin — a diferencia de remove_scheduled_workout(s), que solo la
+    desagenda del calendario, esto la elimina y ya no se puede volver a
+    agendar. Si sigue agendada, desagéndala primero. El workout_id es el que
+    devuelve create_workout."""
+    client = await _client_for_current_user()
+    await asyncio.to_thread(client.delete_workout, workout_id)
+    return {"deleted_workout_id": workout_id}
+
+
 PAGE_STYLE = """
 <style>
   body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }

@@ -168,11 +168,7 @@ async def calendar(client: Garmin, start_date: str, end_date: str) -> dict[str, 
     `scheduled` es la respuesta de Garmin tal cual, agregada mes a mes
     (formato no documentado por Garmin); quien la use debe cruzarla por
     fecha/deporte con `completed_activities`."""
-    start = date.fromisoformat(start_date)
-    end = date.fromisoformat(end_date)
-    if end < start or (end - start).days > 120:
-        raise ValueError("El rango debe ser start <= end y no superar 120 días")
-
+    start, end = _validate_range(start_date, end_date)
     months = _months_between(start, end)
 
     scheduled_by_month, activities = await asyncio.gather(
@@ -185,3 +181,38 @@ async def calendar(client: Garmin, start_date: str, end_date: str) -> dict[str, 
         "scheduled": scheduled_by_month,
         "completed_activities": [_summarize_activity(a) for a in activities],
     }
+
+
+def _validate_range(start_date: str, end_date: str) -> tuple[date, date]:
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    if end < start or (end - start).days > 120:
+        raise ValueError("El rango debe ser start <= end y no superar 120 días")
+    return start, end
+
+
+async def find_scheduled_in_range(client: Garmin, start_date: str, end_date: str) -> list[dict[str, Any]]:
+    """Entradas itemType == "workout" agendadas en [start_date, end_date]:
+    scheduled_workout_id (campo "id" de Garmin — lo que pide
+    unschedule_workout, no el workout_id de la plantilla), fecha y título.
+    calendarItems mezcla varios itemType ("nap", "activity", "workout", ...);
+    solo "workout" son entrenamientos agendados de verdad.
+
+    Usado por workout_builder.remove_scheduled_workouts para el borrado en
+    bloque por rango."""
+    start, end = _validate_range(start_date, end_date)
+    months = _months_between(start, end)
+
+    scheduled_by_month = await asyncio.gather(
+        *(asyncio.to_thread(client.get_scheduled_workouts, y, m) for y, m in months)
+    )
+
+    found = []
+    for month_data in scheduled_by_month:
+        for item in month_data.get("calendarItems", []):
+            item_date = item.get("date")
+            if item.get("itemType") != "workout" or item_date is None:
+                continue
+            if start_date <= item_date <= end_date:
+                found.append({"scheduled_workout_id": item["id"], "date": item_date, "title": item.get("title")})
+    return found
