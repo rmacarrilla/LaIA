@@ -64,15 +64,26 @@ async def _client_for_current_user() -> garmin_client.Garmin:
 
 
 @mcp.tool()
-async def estado(dias: int = 7) -> dict:
+async def estado(dias: int = 7, spo2_detalle: bool = False) -> dict:
     """Cómo está el deportista hoy y en los últimos `dias` días — primera
     llamada de casi cualquier conversación sobre si puede entrenar fuerte,
     cómo viene durmiendo, o cómo lleva la semana. Se refresca siempre, sin
     caché de larga duración: a diferencia de capacidad(), esto cambia día a
     día. Se combina con plan() cuando la pregunta es "qué entreno hoy", y con
-    capacidad() + carga() en revisiones de bloque o de forma."""
+    capacidad() + carga() en revisiones de bloque o de forma.
+
+    Devuelve, entre otros: `entrenamiento` (la fase de entrenamiento de
+    Garmin —MAINTAINING, PRODUCTIVE, PEAKING...—, el reparto de carga del mes
+    frente a su objetivo, y el VO2max), `noches` (una fila por noche con
+    sueño, SpO2 medio, HRV, FC en reposo y temperatura de piel: la serie que
+    dice si un dato malo es puntual o un patrón), `sueno_anoche`,
+    `training_readiness`, body battery y las actividades del rango.
+
+    spo2_detalle=True añade a cada noche el SpO2 mínimo y máximo, que exige
+    una llamada por día — pídelo solo cuando estés investigando una bajada
+    concreta, no por rutina."""
     client = await _client_for_current_user()
-    return await training_data.estado(client, dias)
+    return await training_data.estado(client, dias, spo2_detalle)
 
 
 @mcp.tool()
@@ -81,6 +92,9 @@ async def capacidad(extras: list[str] | None = None) -> dict:
     VO2max, predicciones de carrera. Todo esto cambia en semanas o meses, no
     en minutos — pídela una vez por conversación y reutilízala durante toda
     ella; no tiene sentido volver a llamarla porque haya pasado un rato.
+
+    Incluye `perfil`, con lo que hace falta para prescribir: edad, sexo, peso
+    en kg, altura, VO2max de carrera y bici, y FC y ritmo de umbral.
 
     extras (opcional, bajo demanda, solo si la pregunta concreta lo pide):
     "ftp_progresion" (progresión de FTP en los últimos 6 meses, running y

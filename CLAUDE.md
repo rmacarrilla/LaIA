@@ -165,6 +165,46 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
     vacíos de partida) — el spec documenta el mecanismo pero no enumera cada
     código de Garmin; un código no listado se devuelve tal cual, nunca hace
     fallar una lectura, y se completa según se vaya viendo en uso real.
+  - **Aplanar lo que Garmin entierra, y no devolver series punto a punto**:
+    las dos cosas salieron del mismo feedback real — un modelo usando el
+    conector dijo que le faltaban el estado de entrenamiento y el histórico de
+    SpO2 nocturno, y ninguno de los dos faltaba. Estaban en respuestas que ya
+    se pedían, pero ilegibles: la fase de entrenamiento cuelga de una clave
+    que es el **id del reloj** (`latestTrainingStatusData["3461696276"]`) y
+    llega como código numérico (`trainingStatus: 4`), con el nombre legible
+    solo en `trainingStatusFeedbackPhrase` (`"MAINTAINING_2"`); el SpO2 por
+    noche vive dentro del `values` de cada fila de `get_sleep_daily`. Y sobre
+    todo, estaban ahogados: `estado(7)` pesaba 241 KB, de los que 181 KB eran
+    arrays minuto a minuto del sueño, justo lo que la regla de la cabecera de
+    `training_data.py` prohíbe y que se colaba al pasar las respuestas tal
+    cual. Ahora:
+    - `_del_dispositivo_principal` desanida lo que cuelga de un id de reloj
+      (el marcado `primaryTrainingDevice`, o el más reciente si hay varios) y
+      `_etiqueta_de_frase` saca la etiqueta del prefijo de la frase de
+      feedback. **No hay tabla propia de códigos numéricos de
+      `trainingStatus`**: solo se ha observado un valor (4 ↔ MAINTAINING) y
+      adivinar el resto etiquetaría mal la fase, que es el dato que más pesa;
+      el número se devuelve igualmente en `fase_codigo`.
+    - `estado()` expone `entrenamiento` (fase, reparto de carga del mes frente
+      a objetivo con su `feedback`, VO2max), `noches` (una fila por noche con
+      sueño, SpO2 medio, HRV, FC en reposo y temperatura de piel — la serie
+      que distingue un dato malo puntual de un patrón, a coste cero porque
+      `get_sleep_daily` ya se pedía) y `sueno_anoche`. Con
+      `spo2_detalle=True` añade el mínimo y máximo por noche vía
+      `get_spo2_data`, que es una llamada por día y por eso es opcional.
+    - `capacidad()` expone `perfil` (edad, sexo, **peso en kg** —
+      `userData.weight` viene en gramos, 67000 → 67, misma trampa de unidades
+      que el `speed` del umbral—, altura, VO2max y umbrales).
+    - `_sin_claves` hace cumplir la regla del módulo: fuera las series por
+      época del sueño, el array intradía de body battery, y en las actividades
+      el `metadataDTO` (metadatos de subida del fichero) y `splitSummaries`
+      (el mismo agregado por tramo que el spec ya descarta; para una sesión
+      concreta está `get_activity_splits` en `sesion()`). Resultado medido:
+      `estado(7)` 241 → 28 KB, `carga(10 días)` 121 → 57 KB, `sesion()` 28 →
+      21 KB. Ojo al tocar esa lista: `activityType`/`activityTypeDTO` son el
+      mismo dato con nombre distinto según venga de la lista o del detalle, y
+      sin ellos una actividad se queda sin deporte (y `sesion()` deja de
+      detectar natación y bici).
   - **Las descripciones de las tools son el protocolo de encadenado**: la
     sección 5 del spec ("qué llamar en qué orden para cada tipo de
     conversación") no se implementa como caché ni máquina de estados en el

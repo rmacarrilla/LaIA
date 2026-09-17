@@ -78,21 +78,92 @@ def _soft_time_seconds(activity: dict[str, Any]) -> float | None:
     return duration - sum(zones) + zones[0] + zones[1]
 
 
+# Lo que Garmin mete en cada actividad y no dice nada de entrenamiento. Pesaba
+# el 60% de carga(): metadataDTO son metadatos de subida del fichero (versión
+# de la app, formato, URLs de la foto de perfil) y splitSummaries es el mismo
+# agregado por tramo que el spec ya descarta por calculable desde los splits
+# (y para una sesión concreta ya está get_activity_splits en sesion()). El
+# resto son duplicados que aparecen al fusionar lista y detalle, o datos del
+# dueño de la cuenta, que se sabe de sobra: es quien llama.
+# NO se quita activityType/activityTypeDTO: son la misma cosa con nombres
+# distintos según la respuesta venga de la lista o del detalle, y sin ellos
+# una actividad se queda sin deporte.
+_ACTIVITY_NOISE = frozenset(
+    {
+        "userRoles",
+        "ownerId",
+        "ownerDisplayName",
+        "ownerFullName",
+        "ownerProfileImageUrlLarge",
+        "ownerProfileImageUrlMedium",
+        "ownerProfileImageUrlSmall",
+        "userPro",
+        "metadataDTO",
+        "splitSummaries",
+        "summarizedDiveInfo",
+        "timeZoneUnitDTO",
+        "privacy",
+        "eventType",
+        "activityUUID",
+    }
+)
+
+
+def _sin_claves(dic: dict[str, Any], claves: frozenset[str] | set[str]) -> dict[str, Any]:
+    """Quita claves de un dict. Se usa para hacer cumplir de verdad la regla de
+    la cabecera de este módulo — no devolver series punto a punto —, que hasta
+    ahora estaba escrita pero no aplicada: pasar las respuestas de Garmin tal
+    cual colaba los arrays intradía (sueño minuto a minuto, body battery por
+    época), que llegaron a ser el 75% del tamaño de estado()."""
+    return {k: v for k, v in dic.items() if k not in claves}
+
+
 def _enrich_activity(activity: dict[str, Any]) -> dict[str, Any]:
-    return {**activity, **_rpe_feel(activity), "soft_time_seconds": _soft_time_seconds(activity)}
+    limpia = _sin_claves(activity, _ACTIVITY_NOISE)
+    return {**limpia, **_rpe_feel(activity), "soft_time_seconds": _soft_time_seconds(activity)}
+
+
+def _del_dispositivo_principal(mapa: dict[str, Any] | None) -> dict[str, Any]:
+    """Varias respuestas de Garmin cuelgan el dato de una clave que es el id
+    del reloj (p.ej. latestTrainingStatusData["3461696276"]), imposible de
+    adivinar para quien lea la respuesta. Devuelve la entrada del dispositivo
+    marcado como principal, o la más reciente por calendarDate si ninguna lo
+    marca (cuentas con varios relojes), o {} si no hay nada."""
+    entradas = [v for v in (mapa or {}).values() if isinstance(v, dict)]
+    if not entradas:
+        return {}
+    principales = [e for e in entradas if e.get("primaryTrainingDevice")]
+    candidatas = principales or entradas
+    return max(candidatas, key=lambda e: e.get("calendarDate") or "")
+
+
+def _etiqueta_de_frase(frase: str | None) -> str | None:
+    """"MAINTAINING_2" -> "MAINTAINING". Garmin manda la fase de entrenamiento
+    como código numérico (trainingStatus: 4) y solo deja el nombre legible en
+    la frase de feedback, con un sufijo numérico de variante. Se usa el prefijo
+    de la frase en vez de una tabla propia de códigos: el número se devuelve
+    igualmente tal cual, pero inventarle una tabla a partir de un solo valor
+    observado arriesgaría etiquetar mal la fase, que es el dato que más pesa."""
+    if not frase:
+        return None
+    cuerpo = frase.rsplit("_", 1)
+    return cuerpo[0] if len(cuerpo) == 2 and cuerpo[1].isdigit() else frase
 
 
 def _translate_feedback_phrases(obj: Any) -> Any:
     """Recorre obj recursivamente y traduce con _FEEDBACK_PHRASES cualquier
-    valor bajo una clave 'feedbackPhrase' o que termine en 'Feedback'
-    (hrvFactorFeedback, recoveryTimeFactorFeedback...) — Garmin los devuelve
-    como códigos tipo "HRV_BALANCED_5" sin traducir. Un código no listado en
-    el diccionario se deja tal cual."""
+    valor bajo una clave 'feedbackPhrase', que termine en 'Feedback'
+    (hrvFactorFeedback, recoveryTimeFactorFeedback...) o en 'FeedbackPhrase'
+    (trainingStatusFeedbackPhrase, trainingBalanceFeedbackPhrase — las que de
+    verdad trae get_training_status) — Garmin los devuelve como códigos tipo
+    "HRV_BALANCED_5" sin traducir. Un código no listado en el diccionario se
+    deja tal cual."""
     if isinstance(obj, dict):
         return {
             k: (
                 _FEEDBACK_PHRASES.get(v, v)
-                if isinstance(v, str) and (k == "feedbackPhrase" or k.endswith("Feedback"))
+                if isinstance(v, str)
+                and (k == "feedbackPhrase" or k.endswith("Feedback") or k.endswith("FeedbackPhrase"))
                 else _translate_feedback_phrases(v)
             )
             for k, v in obj.items()
@@ -102,13 +173,138 @@ def _translate_feedback_phrases(obj: Any) -> Any:
     return obj
 
 
-async def estado(client: Garmin, dias: int = 7) -> dict[str, Any]:
+def _entrenamiento(training_status: dict[str, Any]) -> dict[str, Any]:
+    """Aplana get_training_status: fase de entrenamiento, reparto de carga
+    mensual frente a objetivo y VO2max. Los dos primeros cuelgan de una clave
+    que es el id del reloj (ver _del_dispositivo_principal), así que sin esto
+    el dato está pero nadie lo encuentra."""
+    estado_dev = _del_dispositivo_principal(
+        (training_status.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData")
+    )
+    balance = _del_dispositivo_principal(
+        (training_status.get("mostRecentTrainingLoadBalance") or {}).get("metricsTrainingLoadBalanceDTOMap")
+    )
+    vo2 = training_status.get("mostRecentVO2Max") or {}
+
+    return {
+        "fase": _etiqueta_de_frase(estado_dev.get("trainingStatusFeedbackPhrase")),
+        "fase_codigo": estado_dev.get("trainingStatus"),
+        "fase_frase": estado_dev.get("trainingStatusFeedbackPhrase"),
+        "deporte": estado_dev.get("sport"),
+        "fitness_trend": estado_dev.get("fitnessTrend"),
+        "pausado": estado_dev.get("trainingPaused"),
+        "desde": estado_dev.get("sinceDate"),
+        "carga_mensual": {
+            "aerobico_bajo": balance.get("monthlyLoadAerobicLow"),
+            "aerobico_bajo_objetivo": [
+                balance.get("monthlyLoadAerobicLowTargetMin"),
+                balance.get("monthlyLoadAerobicLowTargetMax"),
+            ],
+            "aerobico_alto": balance.get("monthlyLoadAerobicHigh"),
+            "aerobico_alto_objetivo": [
+                balance.get("monthlyLoadAerobicHighTargetMin"),
+                balance.get("monthlyLoadAerobicHighTargetMax"),
+            ],
+            "anaerobico": balance.get("monthlyLoadAnaerobic"),
+            "anaerobico_objetivo": [
+                balance.get("monthlyLoadAnaerobicTargetMin"),
+                balance.get("monthlyLoadAnaerobicTargetMax"),
+            ],
+            "feedback": balance.get("trainingBalanceFeedbackPhrase"),
+        },
+        "vo2max": {
+            "carrera": (vo2.get("generic") or {}).get("vo2MaxPreciseValue"),
+            "bici": (vo2.get("cycling") or {}).get("vo2MaxPreciseValue"),
+        },
+    }
+
+
+# Lo que interesa de cada noche de get_sleep_daily, que lo entrega metido en
+# un sub-dict "values" (nombre de Garmin -> nombre aquí).
+_CAMPOS_NOCHE = {
+    "sleepScore": "sleep_score",
+    "sleepScoreQuality": "calidad",
+    "totalSleepTimeInSeconds": "sueno_total_s",
+    "deepTime": "profundo_s",
+    "lightTime": "ligero_s",
+    "remTime": "rem_s",
+    "awakeTime": "despierto_s",
+    "spO2": "spo2_medio",
+    "avgOvernightHrv": "hrv",
+    "hrv7dAverage": "hrv_media_7d",
+    "hrvStatus": "hrv_estado",
+    "restingHeartRate": "fc_reposo",
+    "respiration": "respiracion",
+    "skinTempC": "temp_piel_c",
+    "sleepNeed": "sueno_necesario",
+    "bodyBatteryChange": "body_battery_cambio",
+}
+
+
+def _noches(sleep_daily: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Una fila por noche con los campos de _CAMPOS_NOCHE sacados de "values".
+    Es la serie que permite distinguir un dato malo puntual de un patrón
+    (SpO2, HRV, FC en reposo, temperatura de piel), y no cuesta ninguna
+    llamada extra: get_sleep_daily ya se pide para el rango de estado()."""
+    noches = []
+    for fila in sleep_daily:
+        valores = fila.get("values") or {}
+        noche = {"fecha": fila.get("calendarDate")}
+        noche.update({destino: valores.get(origen) for origen, destino in _CAMPOS_NOCHE.items()})
+        noches.append(noche)
+    return noches
+
+
+_SLEEP_SERIES = frozenset(
+    {
+        "sleepLevels",
+        "sleepMovement",
+        "sleepHeartRate",
+        "sleepStress",
+        "sleepBodyBattery",
+        "sleepRestlessMoments",
+        "hrvData",
+        "breathingDisruptionData",
+        "remSleepData",
+        "wellnessEpochRespirationAveragesList",
+        "wellnessEpochRespirationDataDTOList",
+        "wellnessEpochSPO2DataDTOList",
+    }
+)
+
+
+def _sueno_anoche(sleep_data: dict[str, Any]) -> dict[str, Any]:
+    """Resumen de la última noche: los escalares de dailySleepDTO (fases,
+    SpO2 medio/mínimo/máximo, respiración) más HRV y FC en reposo. Fuera todas
+    las series por época — eran 181 KB de los 241 KB que pesaba estado()."""
+    diario = _sin_claves(sleep_data.get("dailySleepDTO") or {}, _SLEEP_SERIES)
+    return {
+        **diario,
+        "avgOvernightHrv": sleep_data.get("avgOvernightHrv"),
+        "restingHeartRate": sleep_data.get("restingHeartRate"),
+        "hrvStatus": sleep_data.get("hrvStatus"),
+        "bodyBatteryChange": sleep_data.get("bodyBatteryChange"),
+        "restlessMomentsCount": sleep_data.get("restlessMomentsCount"),
+    }
+
+
+async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> dict[str, Any]:
     """Cómo está el deportista hoy y en los últimos `dias` días — primera
     llamada de casi cualquier conversación sobre si puede entrenar fuerte,
     cómo viene durmiendo, o cómo lleva la semana. Se refresca siempre, sin
     caché de larga duración: a diferencia de capacidad(), esto cambia día a
     día. Se combina con plan() cuando la pregunta es "qué entreno hoy", y con
-    capacidad() + carga() en revisiones de bloque o de forma."""
+    capacidad() + carga() en revisiones de bloque o de forma.
+
+    Devuelve, entre otros: `entrenamiento` (fase de entrenamiento de Garmin
+    —MAINTAINING, PRODUCTIVE, PEAKING...—, reparto de carga del mes frente a
+    su objetivo, y VO2max), `noches` (una fila por noche con sueño, SpO2
+    medio, HRV, FC en reposo y temperatura de piel: la serie que dice si un
+    dato malo es puntual o un patrón) y `sueno_anoche`.
+
+    spo2_detalle=True añade a cada noche el SpO2 mínimo y máximo, que exige
+    una llamada por día — pídelo solo cuando estés investigando una bajada
+    concreta, no por rutina."""
     if not 1 <= dias <= 31:
         raise ValueError("dias debe estar entre 1 y 31")
 
@@ -129,10 +325,31 @@ async def estado(client: Garmin, dias: int = 7) -> dict[str, Any]:
     results = await asyncio.gather(*calls.values())
     out = dict(zip(keys, results))
 
+    noches = _noches(out["sleep_daily"])
+    if spo2_detalle:
+        detalles = await asyncio.gather(
+            *(asyncio.to_thread(client.get_spo2_data, n["fecha"]) for n in noches),
+            return_exceptions=True,
+        )
+        for noche, detalle in zip(noches, detalles):
+            if not isinstance(detalle, BaseException) and detalle:
+                noche["spo2_minimo"] = detalle.get("lowestSpO2")
+                noche["spo2_medio_dia"] = detalle.get("averageSpO2")
+
     return {
         "range": {"start": start_str, "end": end_str},
-        **out,
-        "training_status": _translate_feedback_phrases(out["training_status"]),
+        "entrenamiento": _entrenamiento(_translate_feedback_phrases(out["training_status"])),
+        "training_readiness": _translate_feedback_phrases(out["training_readiness"]),
+        "noches": noches,
+        "sueno_anoche": _sueno_anoche(out["sleep_last_night"]),
+        # charged/drained por día; el array intradía de body battery no vuelve
+        # (regla de la cabecera del módulo). El máximo y mínimo del día de hoy
+        # siguen estando en stats_today.
+        "body_battery": [
+            {"fecha": d.get("date"), "cargado": d.get("charged"), "gastado": d.get("drained")}
+            for d in out["body_battery"]
+        ],
+        "stats_today": _sin_claves(out["stats_today"], {"bodyBatteryActivityEventList"}),
         "activities": [_enrich_activity(a) for a in out["activities"]],
     }
 
@@ -145,6 +362,9 @@ async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str
     VO2max, predicciones de carrera. Todo esto cambia en semanas o meses, no
     en minutos — pídela una vez por conversación y reutilízala durante toda
     ella; no tiene sentido volver a llamarla porque haya pasado un rato.
+
+    Incluye `perfil`, con lo que hace falta para prescribir: edad, sexo, peso
+    en kg, altura, VO2max de carrera y bici, y FC y ritmo de umbral.
 
     extras (opcional, bajo demanda, solo si la pregunta concreta lo pide):
     "ftp_progresion" (progresión de FTP en los últimos 6 meses, running y
@@ -214,6 +434,20 @@ async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str
     lactate = out.get("lactate_threshold")
     speed = (lactate or {}).get("speed_and_heart_rate", {}).get("speed") if isinstance(lactate, dict) else None
     out["lactate_threshold_pace_min_per_km"] = (1000 / (speed * 10) / 60) if speed else None
+
+    # Perfil aplanado: todo esto vive dentro de userData, y el peso viene en
+    # gramos (67000 = 67 kg) — misma trampa de unidades que el speed de arriba.
+    peso_g = user_data.get("weight")
+    out["perfil"] = {
+        "edad": out["age"],
+        "sexo": user_data.get("gender"),
+        "peso_kg": peso_g / 1000 if peso_g else None,
+        "altura_cm": user_data.get("height"),
+        "vo2max_carrera": user_data.get("vo2MaxRunning"),
+        "vo2max_bici": user_data.get("vo2MaxCycling"),
+        "fc_umbral": user_data.get("lactateThresholdHeartRate"),
+        "ritmo_umbral_min_km": out["lactate_threshold_pace_min_per_km"],
+    }
 
     if "records" in extras and isinstance(out.get("personal_records"), list):
         out["personal_records"] = [
