@@ -51,14 +51,37 @@ claude mcp add laia -- "$(pwd)/venv/bin/python" "$(pwd)/mcp_server.py"
 ```
 
 Registra el servidor en Claude Code (modo `stdio`, sin OAuth — pensado para
-desarrollo con tu propia cuenta, no para servir a otras personas). Expone dos
-herramientas:
+desarrollo con tu propia cuenta, no para servir a otras personas). Expone diez
+herramientas, agrupadas por el ritmo al que cambia cada dato y por el tipo de
+pregunta que resuelven (la selección de métodos de Garmin y los cálculos que
+aplica cada una están especificados en
+[`docs/LaIA-MCP-metodos-garmin.md`](docs/LaIA-MCP-metodos-garmin.md)):
 
-- `list_activities`: últimas actividades (id, fecha y nombre) de quien está
-  autenticado.
-- `get_activity_detail`: detalle de una actividad (duración, distancia,
-  calorías, frecuencia cardíaca, velocidad media, desnivel), a partir del
-  `activity_id` devuelto por `list_activities`.
+Lectura:
+
+- `estado(dias=7)`: cómo está el deportista hoy y esta semana — training
+  readiness, body battery, sueño, FC en reposo, estado de entrenamiento y
+  actividades del rango.
+- `capacidad(extras=None)`: de qué es capaz ahora — umbrales, zonas, FTP,
+  VO2max, predicciones de carrera. Bajo demanda: progresión de FTP, récords,
+  hill score, edad de forma física, capacidades del dispositivo.
+- `carga(inicio, fin)`: qué se ha entrenado en un rango — volumen, reparto de
+  intensidad, RPE/sRPE y progresión semanal.
+- `sesion(activity_id, detalle=False, potencia_por_zona=False)`: detalle de una
+  sesión concreta, con splits (y largos con SWOLF en natación).
+- `plan(inicio, fin, workout_id=None)`: qué hay agendado y con qué construirlo
+  — calendario y biblioteca de plantillas juntos.
+
+Escritura:
+
+- `crear_entreno(sport, name, steps)`: sube una plantilla estructurada
+  (correr/bici/nadar/fuerza) sin agendarla.
+- `modificar_entreno(workout_id, sport, name, steps)`: reemplaza la estructura
+  conservando el `workout_id`, así lo ya agendado no se rompe.
+- `agendar(workout_id, date)` / `desagendar(...)`: pone y quita plantillas del
+  calendario (`desagendar` acepta lista de ids o rango de fechas).
+- `borrar_entreno(workout_ids=None, source=None)`: borra plantillas de la
+  biblioteca de verdad, por ids o por origen ("prod_athletedata", "Shape"...).
 
 ### Servidor MCP remoto (HTTP + OAuth)
 

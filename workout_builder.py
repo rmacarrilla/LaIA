@@ -147,12 +147,25 @@ def build_workout(sport: str, name: str, steps: list[dict[str, Any]]) -> BaseWor
 
 
 def upload_workout(client: Garmin, sport: str, name: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
-    """Construye y sube el workout a la cuenta de Garmin del usuario. Llamada
-    bloqueante — envolver con asyncio.to_thread desde la tool."""
+    """Construye y sube el workout a la cuenta de Garmin del usuario — usado
+    por la tool crear_entreno. Llamada bloqueante — envolver con
+    asyncio.to_thread desde la tool."""
     workout = build_workout(sport, name, steps)
     upload = getattr(client, _UPLOAD_METHODS[sport])
     result = upload(workout)
     return {"workout_id": result.get("workoutId"), "name": result.get("workoutName", name)}
+
+
+def update_workout(client: Garmin, workout_id: int, sport: str, name: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reconstruye la plantilla (mismo esquema genérico de pasos que
+    build_workout, usado por crear_entreno) y la manda con update_workout —
+    usado por la tool modificar_entreno. Garmin reemplaza la plantilla
+    entera vía PUT y fuerza el workoutId del cuerpo a coincidir con el de la
+    URL, así que lo ya agendado no se rompe. Llamada bloqueante — envolver
+    con asyncio.to_thread desde la tool."""
+    workout = build_workout(sport, name, steps)
+    result = client.update_workout(workout_id, workout.to_dict())
+    return {"workout_id": workout_id, "result": result}
 
 
 async def unschedule_workouts_in_range(
@@ -201,7 +214,9 @@ async def unschedule_workouts_by_id(client: Garmin, scheduled_workout_ids: list[
 async def delete_workouts(client: Garmin, workout_ids: list[int]) -> dict[str, Any]:
     """Borra de verdad, en paralelo, cada plantilla de la librería de Garmin
     dada en workout_ids — a diferencia de unschedule_workouts_by_id/_in_range,
-    que solo desagendan del calendario."""
+    que solo desagendan del calendario. Modo "ids" de la tool borrar_entreno
+    (mcp_server.py); ver también delete_workouts_by_source para el modo
+    "source"."""
     results = await asyncio.gather(
         *(asyncio.to_thread(client.delete_workout, i) for i in workout_ids),
         return_exceptions=True,
@@ -209,3 +224,16 @@ async def delete_workouts(client: Garmin, workout_ids: list[int]) -> dict[str, A
     deleted = [i for i, r in zip(workout_ids, results) if not isinstance(r, Exception)]
     failed = [i for i, r in zip(workout_ids, results) if isinstance(r, Exception)]
     return {"deleted_count": len(deleted), "deleted_ids": deleted, "failed_ids": failed}
+
+
+async def delete_workouts_by_source(client: Garmin, source: str) -> dict[str, Any]:
+    """Borra de verdad todas las plantillas cuyo origen (training_data.
+    list_workout_templates, campo "source" = consumerName de Garmin, p.ej.
+    "prod_athletedata" o "Shape") coincide exactamente con `source`. Modo
+    "source" de la tool borrar_entreno — para limpiar de golpe las plantillas
+    que deja una integración de terceros sin tener que conocer cada
+    workout_id."""
+    templates = await training_data.list_workout_templates(client)
+    matching_ids = [t["workout_id"] for t in templates if t["source"] == source]
+    result = await delete_workouts(client, matching_ids)
+    return {**result, "source": source}

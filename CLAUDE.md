@@ -91,50 +91,94 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
   habría hecho perder de vista para qué sirve cada llamada y habría disparado
   el consumo de tokens si alguna tool devolviera una respuesta punto a punto
   (FC/potencia por segundo, sueño minuto a minuto, body battery intradía).
-  En su lugar hay 8 tools pensadas para un modelo que hace de entrenador
-  experto en triatlón — planificar, evaluar, re-planificar, generar
-  entrenamientos y agendarlos — cada una devolviendo ya un resumen:
-  - **Lectura** (`training_data.py`): `get_training_snapshot` (fisiología +
-    carga reciente, usando `client.typed` — namespace Pydantic que trae la
-    propia librería — para no adivinar claves de un dict crudo),
-    `get_performance_profile` (FTP, zonas, VO2max, récords... datos que
-    cambian poco, para fijar objetivos de intensidad) y `get_calendar`
-    (cruza lo agendado en Garmin con lo realmente entrenado en un rango, para
-    evaluar y re-planificar). `get_activity_detail` (en `mcp_server.py`) se
-    queda para el detalle de una sesión concreta.
-  - **Escritura** (`workout_builder.py`): `create_workout` (sube una
-    plantilla estructurada — nadar/bici/correr/fuerza — a partir de un
-    esquema JSON genérico de pasos, usando los modelos Pydantic tipados que
-    ya trae `garminconnect.workout`), `schedule_workout` (agenda esa
-    plantilla en el calendario, separado de crearla para poder reutilizar la
-    misma sesión en varias fechas sin recrearla), `unschedule_workouts` y
-    `delete_workouts`. Importante: **desagendar no es borrar** —
-    `unschedule_workout` (lo que usa `unschedule_workouts` por debajo) solo
-    quita la entrada del calendario; la plantilla sigue en la librería de
-    Garmin. `delete_workouts` es la única que borra la plantilla de verdad
-    (`client.delete_workout`, ya la trae `garminconnect`, aquí solo se
-    envuelve).
-    `unschedule_workouts` acepta dos modos mutuamente excluyentes,
-    validados en la propia tool (no expresables en el JSON Schema): por
-    `scheduled_workout_ids` explícitos (`workout_builder.unschedule_workouts_by_id`)
-    o por rango `start_date`/`end_date` con `exclude_ids` opcional
-    (`workout_builder.unschedule_workouts_in_range`, que encuentra
-    candidatos con `training_data.find_scheduled_in_range` — filtra
-    `calendarItems` por `itemType == "workout"`, ya que ese endpoint de
-    Garmin también devuelve `"nap"`, `"activity"`, etc. — y desagenda en
-    paralelo). `delete_workouts(workout_ids: list[int])` acepta también una
-    lista (un solo id es una lista de un elemento) para poder borrar varias
-    plantillas de golpe, igual que el modo rango de `unschedule_workouts`.
-    Ambas tools existían antes como pares singular/plural
-    (`remove_scheduled_workout`/`s`, `delete_workout`) — se fusionaron para
-    eliminar esa duplicación y, de paso, dar borrado en bloque también a
-    las plantillas (antes solo el calendario lo tenía).
-  - **Pendiente**: `create_workout` construye pasos por tiempo/distancia sin
-    target de zona (FC/ritmo/potencia) — la librería no trae helper para eso
-    y Garmin no documenta el shape exacto del dict de target con zona (API no
-    oficial). Antes de añadirlo hay que verificarlo contra un entrenamiento
-    real: crearlo a mano en la app de Garmin y leer su JSON con
-    `get_workout_by_id`.
+  La selección y agrupación exactas — qué 31 de los ~150 métodos se usan, por
+  qué, y qué cálculos aplicar antes de devolver los datos — están
+  especificadas y verificadas campo a campo contra una cuenta real en
+  `docs/LaIA-MCP-metodos-garmin.md`; este apartado resume cómo se llevó esa
+  especificación al código, no la repite entera.
+
+  **Cambio de convención**: a diferencia de una versión anterior de este
+  proyecto, aquí no se usa `client.typed` (el namespace Pydantic de la propia
+  librería) — la especificación se verificó contra los dicts crudos de
+  `connectapi`, con las claves exactas documentadas en su sección 2, así que
+  el código adopta ese mismo estilo en vez de mezclar dos formas de leer la
+  misma API.
+
+  10 tools — 5 de lectura, 5 de escritura:
+  - **Lectura** (`training_data.py`): `estado(dias=7)` (fisiología + carga
+    reciente del día, se refresca siempre), `capacidad(extras=None)` (FTP,
+    zonas, VO2max... cambia en semanas o meses, no se repite dentro de una
+    misma conversación — `extras` trae bajo demanda progresión de FTP,
+    récords, hill score, edad de forma física o las capacidades del
+    dispositivo, `get_devices`, que no tenía hueco natural en ninguna otra
+    tool), `carga(inicio, fin)` (volumen/intensidad de un rango, para
+    revisión de bloque), `sesion(activity_id, detalle=False,
+    potencia_por_zona=False)` (detalle de una sesión conocida — nunca busca
+    actividades, `detalle`/`potencia_por_zona` solo bajo demanda) y
+    `plan(inicio, fin, workout_id=None)` (calendario + biblioteca de
+    plantillas juntos, siempre antes de cualquier escritura).
+  - **Escritura** (`workout_builder.py`): `crear_entreno` (sube una plantilla
+    estructurada — nadar/bici/correr/fuerza — a partir de un esquema JSON
+    genérico de pasos, usando los modelos Pydantic tipados de
+    `garminconnect.workout`; el spec solo lista running/cycling/swimming pero
+    se mantiene también `strength`, que ya existía), `modificar_entreno`
+    (reconstruye la plantilla con `build_workout` —la misma función que usa
+    `crear_entreno`— y la manda con `client.update_workout`, que fuerza el
+    `workoutId` del cuerpo a coincidir con el de la URL: lo ya agendado no se
+    rompe), `agendar`, `desagendar` y `borrar_entreno`. Importante:
+    **desagendar no es borrar** — `unschedule_workout` (lo que usa
+    `desagendar` por debajo) solo quita la entrada del calendario; la
+    plantilla sigue en la librería de Garmin. `borrar_entreno` es la única
+    que la borra de verdad (`client.delete_workout`).
+    `desagendar` y `borrar_entreno` aceptan cada una dos modos mutuamente
+    excluyentes, validados en la propia tool (no expresables en el JSON
+    Schema) — decisión explícita de esta actualización, más allá de lo que
+    dice el spec literalmente, para no repetir el problema real de 48
+    plantillas huérfanas que motivó la fase anterior:
+    - `desagendar`: por `scheduled_workout_ids` explícitos
+      (`workout_builder.unschedule_workouts_by_id`) o por rango
+      `start_date`/`end_date` con `exclude_ids` opcional
+      (`workout_builder.unschedule_workouts_in_range`, que encuentra
+      candidatos con `training_data.find_scheduled_in_range` — filtra
+      `calendarItems` por `itemType == "workout"`, ya que ese endpoint de
+      Garmin también devuelve `"nap"`, `"activity"`, etc.).
+    - `borrar_entreno`: por `workout_ids` explícitos
+      (`workout_builder.delete_workouts`) o por `source` — el origen de la
+      plantilla ("prod_athletedata", "Shape"...) resuelto por
+      `training_data.list_workout_templates` (`workout_builder.
+      delete_workouts_by_source`), para limpiar de golpe lo que deja una
+      integración de terceros sin conocer cada `workout_id`.
+  - **Cálculos aplicados antes de devolver los datos** (sección 4 del spec),
+    todos en `training_data.py`: `_rpe_feel` (RPE = `directWorkoutRpe / 10`,
+    nunca `0` si falta; feel traducido; sRPE = RPE × minutos — usado por
+    `estado`, `carga` y `sesion`), `_soft_time_seconds` (tiempo suave real:
+    duración − suma de las 5 zonas de FC + zona1 + zona2, porque lo que cae
+    por debajo del suelo de zona 1 no se registra en ninguna), edad (dentro
+    de `capacidad`, desde `birthDate`), velocidad de umbral en min/km (dentro
+    de `capacidad`, desde el `speed` en m/s de `get_lactate_threshold`),
+    normalización del id de instancia agendada a `scheduled_workout_id`
+    (`find_scheduled_in_range`, mismo dato que Garmin llama
+    `workoutScheduleId` en la respuesta de `agendar`/`schedule_workout` y
+    `"id"` dentro de cada `calendarItem`). Dos traducciones (`typeId` de
+    récords personales, códigos de `feedbackPhrase`) usan un diccionario
+    deliberadamente incompleto (`_RECORD_TYPE_LABELS`, `_FEEDBACK_PHRASES`,
+    vacíos de partida) — el spec documenta el mecanismo pero no enumera cada
+    código de Garmin; un código no listado se devuelve tal cual, nunca hace
+    fallar una lectura, y se completa según se vaya viendo en uso real.
+  - **Las descripciones de las tools son el protocolo de encadenado**: la
+    sección 5 del spec ("qué llamar en qué orden para cada tipo de
+    conversación") no se implementa como caché ni máquina de estados en el
+    servidor — vive en el docstring de cada tool, para que un modelo que las
+    use por primera vez entienda solo leyéndolas cómo combinarlas (p.ej. el
+    docstring de `capacidad` dice explícitamente que no se repite dentro de
+    la misma conversación; el de `sesion` dice que nunca se llama sin un
+    `activity_id` ya obtenido antes).
+  - **Pendiente**: `crear_entreno`/`modificar_entreno` construyen pasos por
+    tiempo/distancia sin target de zona (FC/ritmo/potencia) — la librería no
+    trae helper para eso y Garmin no documenta el shape exacto del dict de
+    target con zona (API no oficial). Antes de añadirlo hay que verificarlo
+    contra un entrenamiento real: crearlo a mano en la app de Garmin y leer
+    su JSON con `plan(workout_id=...)`.
 - **Identidad de quien llama**: dentro de una tool,
   `mcp.server.auth.middleware.auth_context.get_access_token()` devuelve el
   `AccessToken` validado de la petición en curso; `.subject` es el `user_id` de

@@ -1,9 +1,11 @@
-# Cliente no oficial de la API de Garmin Connect. Extras "workout" y "typed"
-# porque training_data.py/workout_builder.py usan garminconnect.typed (respuestas
-# validadas con Pydantic) y garminconnect.workout (modelos tipados para subir
-# entrenamientos estructurados) — sin esto pydantic solo llegaría de rebote vía
-# mcp, una dependencia transitiva de la que no deberíamos depender.
-garminconnect[workout,typed]==0.3.11
+# Cliente no oficial de la API de Garmin Connect. Extra "workout" porque
+# workout_builder.py usa garminconnect.workout (modelos tipados para construir
+# y subir entrenamientos estructurados) — sin esto pydantic solo llegaría de
+# rebote vía mcp, una dependencia transitiva de la que no deberíamos depender.
+# Ya no se usa el extra "typed": las tools de lectura leen los dicts crudos de
+# connectapi, que es contra lo que se verificó campo a campo la especificación
+# en docs/LaIA-MCP-metodos-garmin.md (misma versión, 0.3.15).
+garminconnect[workout]==0.3.15
 
 # Carga variables desde el fichero .env
 python-dotenv==1.2.3

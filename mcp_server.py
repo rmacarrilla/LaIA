@@ -64,67 +64,84 @@ async def _client_for_current_user() -> garmin_client.Garmin:
 
 
 @mcp.tool()
-async def get_training_snapshot(days: int = 7) -> dict:
-    """Resumen de fisiología (HRV, sueño, FC en reposo, body battery, estrés,
-    training readiness) y de la carga de entrenamiento de los últimos `days`
-    días. Punto de partida para evaluar cómo está el atleta antes de
-    planificar o re-planificar."""
+async def estado(dias: int = 7) -> dict:
+    """Cómo está el deportista hoy y en los últimos `dias` días — primera
+    llamada de casi cualquier conversación sobre si puede entrenar fuerte,
+    cómo viene durmiendo, o cómo lleva la semana. Se refresca siempre, sin
+    caché de larga duración: a diferencia de capacidad(), esto cambia día a
+    día. Se combina con plan() cuando la pregunta es "qué entreno hoy", y con
+    capacidad() + carga() en revisiones de bloque o de forma."""
     client = await _client_for_current_user()
-    return await training_data.training_snapshot(client, days)
+    return await training_data.estado(client, dias)
 
 
 @mcp.tool()
-async def get_performance_profile() -> dict:
-    """Capacidad actual del atleta (FTP ciclista, umbral de carrera, zonas de FC
-    y potencia, VO2max, récords personales, predicciones de carrera, estado de
-    forma). Cambia poco de una llamada a otra — úsalo para fijar objetivos de
-    intensidad correctos al generar entrenamientos con create_workout."""
+async def capacidad(extras: list[str] | None = None) -> dict:
+    """De qué es capaz el deportista ahora mismo: umbrales, zonas, FTP,
+    VO2max, predicciones de carrera. Todo esto cambia en semanas o meses, no
+    en minutos — pídela una vez por conversación y reutilízala durante toda
+    ella; no tiene sentido volver a llamarla porque haya pasado un rato.
+
+    extras (opcional, bajo demanda, solo si la pregunta concreta lo pide):
+    "ftp_progresion" (progresión de FTP en los últimos 6 meses, running y
+    cycling — útil en revisión de bloque), "records" (récords personales),
+    "hill_score" (capacidad en terreno con subidas — solo si hay desnivel
+    relevante en la pregunta), "edad_forma" (edad de forma física, solo si se
+    pregunta por ella), "dispositivo" (capacidades del reloj — respuesta
+    grande; se pide una vez al conectar la cuenta, no en cada conversación)."""
     client = await _client_for_current_user()
-    return await training_data.performance_profile(client)
+    return await training_data.capacidad(client, extras)
 
 
 @mcp.tool()
-async def get_calendar(start_date: str, end_date: str) -> dict:
-    """Cruza lo agendado en el calendario de Garmin con lo realmente entrenado
-    entre start_date y end_date (formato YYYY-MM-DD). Sirve para evaluar
-    (planificado vs. realizado) y para re-planificar (ver huecos o qué queda
-    por agendar)."""
+async def carga(inicio: str, fin: str) -> dict:
+    """Qué se ha entrenado en [inicio, fin] (YYYY-MM-DD): volumen por
+    disciplina, reparto de intensidad, progresión semanal. La llamada de la
+    revisión de bloque o de mesociclo — pídela después de estado() y
+    capacidad(), no antes (hace falta saber cómo está el deportista y de qué
+    es capaz para interpretar el volumen que se ha hecho)."""
     client = await _client_for_current_user()
-    return await training_data.calendar(client, start_date, end_date)
+    return await training_data.carga(client, inicio, fin)
 
 
 @mcp.tool()
-async def get_activity_detail(activity_id: int) -> dict:
-    """Devuelve el detalle de una actividad de Garmin Connect (duración, distancia,
-    calorías, frecuencia cardíaca, velocidad media, desnivel y splits por tramo).
-    El activity_id se obtiene de get_training_snapshot o get_calendar."""
-    client = await _client_for_current_user()
-    activity, splits = await asyncio.gather(
-        asyncio.to_thread(client.get_activity, str(activity_id)),
-        asyncio.to_thread(client.get_activity_splits, str(activity_id)),
-    )
-    summary = activity["summaryDTO"]
+async def sesion(activity_id: int, detalle: bool = False, potencia_por_zona: bool = False) -> dict:
+    """Qué pasó en una sesión concreta. Nunca se llama sin un activity_id ya
+    obtenido antes de estado() o de plan() — esta tool no busca actividades,
+    solo detalla una que ya se conoce.
 
-    return {
-        "name": activity["activityName"],
-        "type": activity["activityTypeDTO"]["typeKey"],
-        "date": summary["startTimeLocal"],
-        "duration_seconds": summary.get("duration"),
-        "distance_meters": summary.get("distance"),
-        "calories": summary.get("calories"),
-        "average_hr": summary.get("averageHR"),
-        "max_hr": summary.get("maxHR"),
-        "average_speed_mps": summary.get("averageSpeed"),
-        "elevation_gain_meters": summary.get("elevationGain"),
-        "splits": splits,
-    }
+    detalle=True trae además la serie punto a punto (hasta 2000 puntos) —
+    pídelo solo cuando la pregunta sea de deriva cardiaca o desacople, nunca
+    por defecto. potencia_por_zona=True trae el reparto de potencia por zona
+    — solo tiene sentido en bici (se ignora en cualquier otro deporte) y solo
+    si se pregunta específicamente por ese reparto."""
+    client = await _client_for_current_user()
+    return await training_data.sesion(client, activity_id, detalle, potencia_por_zona)
 
 
 @mcp.tool()
-async def create_workout(sport: str, name: str, steps: list[dict]) -> dict:
+async def plan(inicio: str, fin: str, workout_id: int | None = None) -> dict:
+    """Qué hay agendado en [inicio, fin] (YYYY-MM-DD) y con qué construirlo —
+    junta el calendario y la biblioteca de plantillas, para no crear una
+    plantilla nueva cuando ya existe una parecida. Siempre antes de cualquier
+    escritura (crear_entreno, modificar_entreno, agendar, desagendar,
+    borrar_entreno): ninguna se hace sin haber leído antes plan(), y
+    cualquier escritura invalida lo leído aquí para esa fecha — si vas a
+    encadenar otro cambio en el mismo rango, vuelve a llamar a plan() en vez
+    de reutilizar esta lectura.
+
+    workout_id (opcional): además, la estructura completa de esa plantilla
+    concreta — pásalo cuando vayas a leerla, clonarla o modificarla."""
+    client = await _client_for_current_user()
+    return await training_data.plan(client, inicio, fin, workout_id)
+
+
+@mcp.tool()
+async def crear_entreno(sport: str, name: str, steps: list[dict]) -> dict:
     """Crea (sube a la librería de entrenamientos de Garmin) un entrenamiento
-    estructurado por intervalos, sin agendarlo todavía — usa schedule_workout
-    para ponerlo en una fecha del calendario.
+    estructurado por intervalos, sin agendarlo todavía — usa agendar() para
+    ponerlo en una fecha del calendario. Llama antes a plan() para no crear
+    una plantilla casi idéntica a otra que ya existe.
 
     sport: "running" | "cycling" | "swimming" | "strength".
 
@@ -138,34 +155,69 @@ async def create_workout(sport: str, name: str, steps: list[dict]) -> dict:
          "reps": N, "rest_seconds": N, "exercise_name": "" , "weight_kg": N}
 
     Primera versión sin objetivo de zona (FC/ritmo/potencia) por tramo — solo
-    estructura por tiempo/distancia."""
+    estructura por tiempo/distancia.
+
+    Tras escribir, lo que devolvió plan() para esa fecha queda
+    desactualizado: vuelve a llamarlo antes del siguiente cambio en el
+    mismo rango."""
     client = await _client_for_current_user()
     return await asyncio.to_thread(workout_builder.upload_workout, client, sport, name, steps)
 
 
 @mcp.tool()
-async def schedule_workout(workout_id: int, date: str) -> dict:
+async def modificar_entreno(workout_id: int, sport: str, name: str, steps: list[dict]) -> dict:
+    """Reemplaza la estructura completa de una plantilla ya existente (mismo
+    esquema de pasos que crear_entreno) conservando su workout_id — lo ya
+    agendado con ella no se rompe. Llama antes a plan(workout_id=...) para
+    partir de la estructura real de la plantilla, no de una suposición.
+
+    steps: lista de pasos, cada uno un dict con "kind":
+      - "warmup" | "cooldown" | "recovery": {"kind": ..., "duration_seconds": N}
+      - "interval": {"kind": "interval", "duration_seconds": N} o
+        {"kind": "interval", "distance_meters": N}
+      - "repeat": {"kind": "repeat", "count": N, "steps": [...]} (anidado)
+      - "strength_set" (solo sport="strength"):
+        {"kind": "strength_set", "category": "BENCH_PRESS", "sets": N,
+         "reps": N, "rest_seconds": N, "exercise_name": "" , "weight_kg": N}
+
+    Tras escribir, lo que devolvió plan() para esa fecha queda
+    desactualizado: vuelve a llamarlo antes del siguiente cambio en el
+    mismo rango."""
+    client = await _client_for_current_user()
+    return await asyncio.to_thread(workout_builder.update_workout, client, workout_id, sport, name, steps)
+
+
+@mcp.tool()
+async def agendar(workout_id: int, date: str) -> dict:
     """Agenda en el calendario de Garmin, en la fecha dada (YYYY-MM-DD), un
-    entrenamiento ya creado con create_workout. Se puede llamar varias veces
-    con el mismo workout_id para repetir la misma sesión en distintas fechas."""
+    entrenamiento ya creado con crear_entreno. Se puede llamar varias veces
+    con el mismo workout_id para repetir la misma sesión en distintas fechas.
+    Llama antes a plan() para comprobar que la fecha está libre. Tras escribir, lo que devolvió plan() para esa fecha queda
+    desactualizado: vuelve a llamarlo antes del siguiente cambio en el
+    mismo rango."""
     client = await _client_for_current_user()
     return await asyncio.to_thread(client.schedule_workout, workout_id, date)
 
 
 @mcp.tool()
-async def unschedule_workouts(
+async def desagendar(
     scheduled_workout_ids: list[int] | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     exclude_ids: list[int] | None = None,
 ) -> dict:
     """Desagenda del calendario de Garmin (sin borrar plantillas — usa
-    delete_workouts para eso) uno o varios entrenamientos agendados.
+    borrar_entreno para eso) uno o varios entrenamientos agendados. Llama
+    antes a plan() para saber qué scheduled_workout_id tocar.
 
     Dos modos, uno u otro (no combinar):
-      - Por ids: scheduled_workout_ids=[...] (los que da get_calendar).
+      - Por ids: scheduled_workout_ids=[...] (los que da plan()).
       - Por rango: start_date + end_date (YYYY-MM-DD, inclusive; máximo 120
         días); exclude_ids opcional para no tocar algunas entradas del rango.
+
+    Tras escribir, lo que devolvió plan() para esa fecha queda
+    desactualizado: vuelve a llamarlo antes del siguiente cambio en el
+    mismo rango.
     """
     # Validar antes de resolver el cliente: una llamada mal formada no debe
     # gastar una lectura a Postgres ni reconstruir la sesión de Garmin.
@@ -186,14 +238,29 @@ async def unschedule_workouts(
 
 
 @mcp.tool()
-async def delete_workouts(workout_ids: list[int]) -> dict:
-    """Borra de verdad una o varias plantillas de la librería de
-    entrenamientos de Garmin — a diferencia de unschedule_workouts, que solo
-    desagenda del calendario, esto las elimina y ya no se pueden volver a
-    agendar. Si siguen agendadas, desagéndalas primero. Los workout_id son
-    los que devuelve create_workout."""
+async def borrar_entreno(workout_ids: list[int] | None = None, source: str | None = None) -> dict:
+    """Borra de verdad una o varias plantillas de la librería de Garmin — a
+    diferencia de desagendar, que solo quita la entrada del calendario, esto
+    las elimina y ya no se pueden volver a agendar. Si siguen agendadas,
+    desagéndalas primero.
+
+    Dos modos, uno u otro (no combinar):
+      - Por ids: workout_ids=[...] (los que da plan(), campo workout_id).
+      - Por origen: source="prod_athletedata" (o el valor que sea) — borra
+        todas las plantillas de ese origen (campo "source" de plan()), para
+        limpiar de golpe lo que deja una integración de terceros.
+
+    Tras escribir, lo que devolvió plan() para esa fecha queda
+    desactualizado: vuelve a llamarlo antes del siguiente cambio en el
+    mismo rango."""
+    if (workout_ids is None) == (source is None):
+        raise ValueError("Pasa workout_ids O source, no ambos ni ninguno")
+
     client = await _client_for_current_user()
-    return await workout_builder.delete_workouts(client, workout_ids)
+    if workout_ids is not None:
+        return await workout_builder.delete_workouts(client, workout_ids)
+    assert source is not None
+    return await workout_builder.delete_workouts_by_source(client, source)
 
 
 PAGE_STYLE = """
@@ -406,8 +473,8 @@ if __name__ == "__main__":
                     # pending_authorize sin límite si esto no se cubre aparte.
                     ("GET", "/authorize"): RateLimiter(max_requests=20, window_seconds=900),
                     # /mcp: red de seguridad basta (por IP, no por token) contra un
-                    # bucle descontrolado de tool calls — algunas (get_training_snapshot,
-                    # get_calendar) disparan decenas de llamadas a Garmin cada una: sin
+                    # bucle descontrolado de tool calls — algunas (estado, carga,
+                    # plan) disparan decenas de llamadas a Garmin cada una: sin
                     # esto, nada limita cuántas veces se repiten por minuto.
                     ("POST", "/mcp"): RateLimiter(max_requests=60, window_seconds=60),
                 },
