@@ -277,10 +277,19 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
     los pasos con botón de vuelta porque su duración la decide el deportista.
     Lo único que no se puede verificar por API es si el reloj **muestra** el
     texto del paso en pantalla: eso es comportamiento del dispositivo.
+  - **Fuerza**: `strength_set` monta un bloque completo (series × (reps +
+    descanso)) con `create_strength_set`; el paso de ejercicio termina por
+    `reps`, no por tiempo, y el de descanso es de tipo `rest`. Verificado con
+    prueba controlada: se sube, se relee, se agenda, se desagenda y se borra
+    igual que el resto. La duración estimada va como 0 y Garmin la acepta —
+    la fuerza se mide en repeticiones. Ojo al peso: `weightValue` se guarda
+    en **gramos** con etiqueta "kilogram" (20 kg -> 20000.0), así que `plan()`
+    añade `weight_kg` al lado al devolver una plantilla, que si no se lee
+    como 20 toneladas.
   - **Pendiente**: sigue sin haber objetivo de FC ni de ritmo con alerta
     sonora, a propósito (en carrera el ritmo va como texto para no
-    interrumpir con pitidos), y `upload_strength_workout` es el único camino
-    de escritura que no ha pasado la prueba controlada.
+    interrumpir con pitidos). Ya no queda ningún camino de escritura sin
+    verificar.
 - **Identidad de quien llama**: dentro de una tool,
   `mcp.server.auth.middleware.auth_context.get_access_token()` devuelve el
   `AccessToken` validado de la petición en curso; `.subject` es el `user_id` de

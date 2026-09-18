@@ -45,11 +45,15 @@ _WORKOUT_CLASSES: dict[str, type[BaseWorkout]] = {
     "strength": StrengthWorkout,
 }
 
+# Copiados del catálogo real de Garmin, campo a campo (strength_training tiene
+# displayOrder 4, no 5 como estaba antes: Garmin lo aceptaba igual porque lo
+# que mira es el sportTypeId, pero no hay motivo para llevar un valor que no
+# es el suyo).
 _SPORT_TYPES: dict[str, dict[str, Any]] = {
     "running": {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1},
     "cycling": {"sportTypeId": 2, "sportTypeKey": "cycling", "displayOrder": 2},
     "swimming": {"sportTypeId": 4, "sportTypeKey": "swimming", "displayOrder": 3},
-    "strength": {"sportTypeId": 5, "sportTypeKey": "strength_training", "displayOrder": 5},
+    "strength": {"sportTypeId": 5, "sportTypeKey": "strength_training", "displayOrder": 4},
 }
 
 _UPLOAD_METHODS: dict[str, str] = {

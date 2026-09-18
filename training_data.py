@@ -675,6 +675,30 @@ def _validate_range(start_date: str, end_date: str) -> tuple[date, date]:
     return start, end
 
 
+def _con_peso_en_kg(workout_detail: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Añade `weight_kg` a cada paso de fuerza que lleve peso. Garmin guarda
+    `weightValue` en **gramos** pero lo etiqueta con unidad "kilogram"
+    (20 kg -> 20000.0 con unitKey "kilogram"), comprobado subiendo y
+    releyendo una plantilla real. Leído tal cual, eso son 20 toneladas: es la
+    clase de dato que no falla, solo miente, así que se deja el valor
+    original y se añade al lado el mismo número ya convertido."""
+    if not workout_detail:
+        return workout_detail
+
+    def recorrer(pasos: list[dict[str, Any]]) -> None:
+        for paso in pasos:
+            gramos = paso.get("weightValue")
+            if gramos is not None:
+                paso["weight_kg"] = gramos / 1000
+            hijos = paso.get("workoutSteps")
+            if hijos:
+                recorrer(hijos)
+
+    for segmento in workout_detail.get("workoutSegments") or []:
+        recorrer(segmento.get("workoutSteps") or [])
+    return workout_detail
+
+
 async def plan(client: Garmin, inicio: str, fin: str, workout_id: int | None = None) -> dict[str, Any]:
     """Qué hay agendado en [inicio, fin] y con qué construirlo — junta el
     calendario y la biblioteca de plantillas, para no crear una plantilla
@@ -701,7 +725,7 @@ async def plan(client: Garmin, inicio: str, fin: str, workout_id: int | None = N
         "advertencias": advertencias,
         "scheduled": out["scheduled"] or [],
         "templates": out["templates"] or [],
-        "workout_detail": out.get("workout_detail"),
+        "workout_detail": _con_peso_en_kg(out.get("workout_detail")),
     }
 
 
