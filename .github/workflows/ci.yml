@@ -1,0 +1,42 @@
+name: CI
+
+# Antes de esto, cualquier regresión llegaba a producción sin red: Railway
+# despliega solo con cada push a main. Esto corre primero.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  comprobaciones:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Tipos (mypy)
+        # Los avisos de import-untyped son conocidos y esperados: garminconnect
+        # y asyncpg no traen stubs. Lo que no puede aparecer es un error nuevo,
+        # así que se comparan los tipos de error, no el texto completo.
+        run: mypy . --no-error-summary > /tmp/mypy.txt 2>&1 || true
+
+      - name: Fallar si mypy encuentra algo que no sea falta de stubs
+        run: |
+          nuevos=$(grep -v "import-untyped" /tmp/mypy.txt | grep -c "error:" || true)
+          conocidos=$(grep -c "oauth_provider.py.*return-value" /tmp/mypy.txt || true)
+          echo "errores no relacionados con stubs: $nuevos (de los que $conocidos son los ya conocidos de oauth_provider)"
+          if [ "$nuevos" -gt "$conocidos" ]; then
+            echo "::error::mypy encontró errores nuevos"
+            grep -v "import-untyped" /tmp/mypy.txt | grep "error:" || true
+            exit 1
+          fi
+
+      - name: Tests
+        run: pytest -q

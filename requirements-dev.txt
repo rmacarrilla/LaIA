@@ -1,0 +1,8 @@
+# Dependencias de desarrollo: NO se instalan en producción (Railway solo lee
+# requirements.txt). Aquí va lo que hace falta para correr los tests y los
+# chequeos que ejecuta la CI en cada push.
+-r requirements.txt
+
+pytest==8.4.2
+pytest-asyncio==1.2.0
+mypy==1.18.2

@@ -370,6 +370,39 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
   (trivial de conseguir, `/register` es público) se podían generar
   `pending_authorize` sin límite si solo se cubría `/register`.
 
+## Tests y CI
+
+`pytest -q` (0,8 s, sin red ni credenciales) y un workflow de GitHub Actions
+que lo corre junto a `mypy` en cada push a `main` y en cada PR. Antes de esto
+cualquier regresión llegaba a producción sin red, porque Railway despliega
+solo con el push.
+
+No se busca cobertura por cobertura: los tests cubren **invariantes que ya han
+fallado alguna vez en este proyecto**, que es donde una regresión sería
+silenciosa y cara.
+
+- `tests/test_tokens_un_solo_uso.py` — un authorization code o un refresh ya
+  canjeado se rechaza, **incluso con dos peticiones concurrentes**, y los
+  tokens se guardan con caducidad. Este fallo ocurrió dos veces: primero con
+  el code y después, idéntico, con el refresh.
+- `tests/test_login_no_filtra_cuentas.py` — el error de login es el mismo
+  exista la cuenta de Garmin o no, y no se escapa ningún fragmento del
+  mensaje original de `garminconnect` por el que deducir el motivo.
+- `tests/test_aislamiento_entre_usuarios.py` — cada tool usa la sesión de
+  quien hizo la petición; el caché de `garmin_client` es estado de proceso
+  compartido, así que se comprueba explícitamente que su clave incluye el
+  `user_id` y que dos usuarios concurrentes no se mezclan.
+- `tests/test_borrado_en_dos_pasos.py` — el modo por filtro de `desagendar` y
+  `borrar_entreno` nunca ejecuta; solo el modo por ids.
+
+El doble de `db.py` (`tests/conftest.py`) reproduce a propósito la semántica
+que importa: `delete_object` devuelve **si de verdad borró una fila**. Un
+doble que devolviera siempre `True` haría pasar los tests con el bug dentro.
+
+La puerta de `mypy` en la CI no exige cero errores —`garminconnect` y
+`asyncpg` no traen stubs— sino que no aparezca ninguno **más allá de los ya
+conocidos**. Está comprobado que falla al introducir uno nuevo.
+
 ## Historia relevante
 
 - Versión anterior (single-usuario): una única cuenta "activa" compartida,
