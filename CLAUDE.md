@@ -257,12 +257,30 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
     docstring de `capacidad` dice explícitamente que no se repite dentro de
     la misma conversación; el de `sesion` dice que nunca se llama sin un
     `activity_id` ya obtenido antes).
-  - **Pendiente**: `crear_entreno`/`modificar_entreno` construyen pasos por
-    tiempo/distancia sin target de zona (FC/ritmo/potencia) — la librería no
-    trae helper para eso y Garmin no documenta el shape exacto del dict de
-    target con zona (API no oficial). Antes de añadirlo hay que verificarlo
-    contra un entrenamiento real: crearlo a mano en la app de Garmin y leer
-    su JSON con `plan(workout_id=...)`.
+  - **Construcción de pasos (`workout_builder.py`)**: un paso termina por
+    tiempo, por distancia o por **botón de vuelta** (`lap_button`), y puede
+    llevar **objetivo de potencia** (`power_watts` + `power_margin_watts`, que
+    se traduce a `targetValueOne`/`targetValueTwo`) y **texto propio**
+    (`text` → el campo `description` del paso). Los ids y claves de texto
+    salen del catálogo real de Garmin (`/workout-service/workout/types`), no
+    de suposiciones: tienen que coincidir exactamente o la plantilla se
+    rechaza. Por eso los pasos se arman construyendo `ExecutableStep`
+    directamente en vez de con los helpers de la librería, que fijan el fin
+    por tiempo y no dejan poner botón de vuelta.
+    Sobre la potencia: el catálogo no solo tiene `power.zone` (instantánea)
+    sino `power.3s`/`power.10s`/`power.30s`, que comparan contra la potencia
+    **promediada**. Eso ataca en origen la oscilación de la lectura — el
+    motivo por el que el spec pedía ensanchar el margen a mano — así que el
+    valor por defecto es `power.3s`, ajustable con `power_avg`.
+    Todo esto verificado con prueba controlada contra la cuenta real (crear →
+    releer campo a campo → borrar), incluida la duración estimada, que ignora
+    los pasos con botón de vuelta porque su duración la decide el deportista.
+    Lo único que no se puede verificar por API es si el reloj **muestra** el
+    texto del paso en pantalla: eso es comportamiento del dispositivo.
+  - **Pendiente**: sigue sin haber objetivo de FC ni de ritmo con alerta
+    sonora, a propósito (en carrera el ritmo va como texto para no
+    interrumpir con pitidos), y `upload_strength_workout` es el único camino
+    de escritura que no ha pasado la prueba controlada.
 - **Identidad de quien llama**: dentro de una tool,
   `mcp.server.auth.middleware.auth_context.get_access_token()` devuelve el
   `AccessToken` validado de la petición en curso; `.subject` es el `user_id` de

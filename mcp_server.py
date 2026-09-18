@@ -160,13 +160,28 @@ async def crear_entreno(sport: str, name: str, steps: list[dict]) -> dict:
     sport: "running" | "cycling" | "swimming" | "strength".
 
     steps: lista de pasos, cada uno un dict con "kind":
-      - "warmup" | "cooldown" | "recovery": {"kind": ..., "duration_seconds": N}
-      - "interval": {"kind": "interval", "duration_seconds": N} o
-        {"kind": "interval", "distance_meters": N}
+      - "warmup" | "cooldown" | "recovery" | "interval"
       - "repeat": {"kind": "repeat", "count": N, "steps": [...]} (anidado)
       - "strength_set" (solo sport="strength"):
         {"kind": "strength_set", "category": "BENCH_PRESS", "sets": N,
          "reps": N, "rest_seconds": N, "exercise_name": "" , "weight_kg": N}
+
+    Cómo termina cada paso — una de estas tres:
+      - por tiempo: {"duration_seconds": N}
+      - por distancia: {"distance_meters": N}
+      - por botón de vuelta: {"lap_button": true} — dura hasta que el
+        deportista pulsa el botón. Es lo que se usa en series de pista y
+        salidas de grupo, donde no hay una duración fija que programar.
+
+    Objetivo de potencia (bici/rodillo), opcional por paso:
+      {"power_watts": 220, "power_margin_watts": 20} da un rango de 200-240 W.
+      "power_avg": "3s" (por defecto) | "10s" | "30s" | "instantanea" elige
+      contra qué potencia se compara; las promediadas evitan que el reloj pite
+      por la oscilación de la lectura instantánea aunque la media del
+      intervalo esté bien.
+
+    Texto del paso, opcional: {"text": "Serie 1000m a 4:30/km"}. En carrera se
+    pone así el ritmo objetivo, en vez de un objetivo con alerta sonora.
 
     Primera versión sin objetivo de zona (FC/ritmo/potencia) por tramo — solo
     estructura por tiempo/distancia.
@@ -186,13 +201,28 @@ async def modificar_entreno(workout_id: int, sport: str, name: str, steps: list[
     partir de la estructura real de la plantilla, no de una suposición.
 
     steps: lista de pasos, cada uno un dict con "kind":
-      - "warmup" | "cooldown" | "recovery": {"kind": ..., "duration_seconds": N}
-      - "interval": {"kind": "interval", "duration_seconds": N} o
-        {"kind": "interval", "distance_meters": N}
+      - "warmup" | "cooldown" | "recovery" | "interval"
       - "repeat": {"kind": "repeat", "count": N, "steps": [...]} (anidado)
       - "strength_set" (solo sport="strength"):
         {"kind": "strength_set", "category": "BENCH_PRESS", "sets": N,
          "reps": N, "rest_seconds": N, "exercise_name": "" , "weight_kg": N}
+
+    Cómo termina cada paso — una de estas tres:
+      - por tiempo: {"duration_seconds": N}
+      - por distancia: {"distance_meters": N}
+      - por botón de vuelta: {"lap_button": true} — dura hasta que el
+        deportista pulsa el botón. Es lo que se usa en series de pista y
+        salidas de grupo, donde no hay una duración fija que programar.
+
+    Objetivo de potencia (bici/rodillo), opcional por paso:
+      {"power_watts": 220, "power_margin_watts": 20} da un rango de 200-240 W.
+      "power_avg": "3s" (por defecto) | "10s" | "30s" | "instantanea" elige
+      contra qué potencia se compara; las promediadas evitan que el reloj pite
+      por la oscilación de la lectura instantánea aunque la media del
+      intervalo esté bien.
+
+    Texto del paso, opcional: {"text": "Serie 1000m a 4:30/km"}. En carrera se
+    pone así el ritmo objetivo, en vez de un objetivo con alerta sonora.
 
     Tras escribir, lo que devolvió plan() para esa fecha queda
     desactualizado: vuelve a llamarlo antes del siguiente cambio en el

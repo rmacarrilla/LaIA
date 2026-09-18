@@ -1,12 +1,16 @@
 """Traduce un esquema de entrenamiento genérico (independiente del deporte) a los
 modelos tipados de garminconnect.workout y lo sube a Garmin Connect.
 
-Primera iteración: solo pasos por tiempo/distancia, sin target de zona
-(FC/ritmo/potencia). La librería no trae helper para construir el dict de
-target con zona — solo se documenta el caso NO_TARGET — y Garmin no publica
-el shape exacto (API no oficial). Añadir el target de zona requiere antes
-verificarlo contra un entrenamiento real: crearlo a mano en la app de Garmin
-y leer su JSON con get_workout_by_id.
+Un paso puede terminar por tiempo, por distancia o por botón de vuelta
+(`lap_button`), y llevar objetivo de potencia con rango calculado a mano
+(`power_watts` + `power_margin_watts`) o texto propio (`text`). Los ids y las
+claves de texto de condiciones y objetivos salen del catálogo real de Garmin
+(`/workout-service/workout/types`), no de suposiciones: tienen que coincidir
+exactamente o Garmin rechaza la plantilla.
+
+Sigue sin haber objetivo de FC ni de ritmo con alerta sonora, a propósito: en
+carrera el ritmo va como texto en el propio paso para no interrumpir con
+pitidos (ver docs/LaIA-MCP-metodos-garmin.md).
 """
 
 from __future__ import annotations
@@ -18,20 +22,18 @@ from typing import Any
 from garminconnect import Garmin
 from garminconnect.workout import (
     BaseWorkout,
+    ConditionType,
     CyclingWorkout,
     ExecutableStep,
+    StepType,
+    TargetType,
     RepeatGroup,
     RunningWorkout,
     StrengthWorkout,
     SwimmingWorkout,
     WorkoutSegment,
-    create_cooldown_step,
-    create_distance_interval_step,
-    create_interval_step,
-    create_recovery_step,
     create_repeat_group,
     create_strength_set,
-    create_warmup_step,
 )
 
 import training_data
@@ -57,10 +59,41 @@ _UPLOAD_METHODS: dict[str, str] = {
     "strength": "upload_strength_workout",
 }
 
-_TIMED_STEP_BUILDERS = {
-    "warmup": create_warmup_step,
-    "cooldown": create_cooldown_step,
-    "recovery": create_recovery_step,
+# Valores sacados del catálogo real de Garmin (`/workout-service/workout/types`),
+# no de una suposición: los ids y las claves de texto tienen que coincidir
+# exactamente o Garmin rechaza la plantilla. Los stepTypeId de la librería
+# coinciden con el catálogo, así que se reutilizan sus constantes.
+_STEP_TYPES: dict[str, dict[str, Any]] = {
+    "warmup": {"stepTypeId": StepType.WARMUP, "stepTypeKey": "warmup", "displayOrder": 1},
+    "cooldown": {"stepTypeId": StepType.COOLDOWN, "stepTypeKey": "cooldown", "displayOrder": 2},
+    "interval": {"stepTypeId": StepType.INTERVAL, "stepTypeKey": "interval", "displayOrder": 3},
+    "recovery": {"stepTypeId": StepType.RECOVERY, "stepTypeKey": "recovery", "displayOrder": 4},
+}
+
+_END_LAP_BUTTON = {
+    "conditionTypeId": ConditionType.LAP_BUTTON,
+    "conditionTypeKey": "lap.button",
+    "displayOrder": 1,
+    "displayable": True,
+}
+_END_TIME = {"conditionTypeId": ConditionType.TIME, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True}
+_END_DISTANCE = {
+    "conditionTypeId": ConditionType.DISTANCE,
+    "conditionTypeKey": "distance",
+    "displayOrder": 3,
+    "displayable": True,
+}
+
+_TARGET_NONE = {"workoutTargetTypeId": TargetType.NO_TARGET, "workoutTargetTypeKey": "no.target", "displayOrder": 1}
+# power.zone vale para un rango de vatios calculado a mano; power.3s/10s/30s
+# son el mismo rango pero comparado contra la potencia promediada a esos
+# segundos, que es lo que evita los pitidos por la oscilación de la lectura
+# instantánea sin tener que ensanchar tanto el rango.
+_TARGETS_POTENCIA = {
+    "instantanea": {"workoutTargetTypeId": 2, "workoutTargetTypeKey": "power.zone", "displayOrder": 2},
+    "3s": {"workoutTargetTypeId": 10, "workoutTargetTypeKey": "power.3s", "displayOrder": 10},
+    "10s": {"workoutTargetTypeId": 11, "workoutTargetTypeKey": "power.10s", "displayOrder": 11},
+    "30s": {"workoutTargetTypeId": 12, "workoutTargetTypeKey": "power.30s", "displayOrder": 12},
 }
 
 
@@ -71,10 +104,74 @@ def _duration_seconds(step: dict[str, Any]) -> float:
         raise ValueError(f"El paso {step!r} necesita 'duration_seconds'") from None
 
 
-def _build_interval(step: dict[str, Any], order: int) -> ExecutableStep:
+def _fin_de_paso(step: dict[str, Any]) -> tuple[dict[str, Any], float | None]:
+    """Cómo termina el paso. Por defecto por tiempo o distancia; con
+    `lap_button: true` termina cuando el deportista pulsa el botón de vuelta,
+    que es como se marcan las series en pista y en las salidas de grupo — ahí
+    no hay una duración fija que programar, la marca el propio deportista."""
+    if step.get("lap_button"):
+        return _END_LAP_BUTTON, None
     if "distance_meters" in step:
-        return create_distance_interval_step(float(step["distance_meters"]), order)
-    return create_interval_step(_duration_seconds(step), order)
+        return _END_DISTANCE, float(step["distance_meters"])
+    return _END_TIME, _duration_seconds(step)
+
+
+def _objetivo(step: dict[str, Any]) -> tuple[dict[str, Any], float | None, float | None]:
+    """Objetivo de potencia para los pasos que lo lleven, centrado en
+    `power_watts` y ensanchado por `power_margin_watts` (220 W con margen de
+    20 → 200-240 W). Se calcula a mano en vez de referenciar la zona que el
+    deportista tiene configurada, porque esa zona es demasiado estrecha para
+    un intervalo: la lectura de potencia oscila y un margen ajustado hace
+    pitar el reloj aunque la media del intervalo esté bien.
+
+    `power_avg` elige contra qué se compara: "3s", "10s" o "30s" usan la
+    potencia promediada a esos segundos (el propio Garmin los ofrece como
+    tipos de objetivo distintos), que ataca la oscilación en origen;
+    "instantanea" es el valor crudo. Por defecto 3s.
+
+    En carrera no se pone objetivo con alerta: el ritmo va como texto en el
+    propio paso (campo `text`), sin pitido que interrumpa."""
+    vatios = step.get("power_watts")
+    if vatios is None:
+        return _TARGET_NONE, None, None
+
+    margen = float(step.get("power_margin_watts", 0))
+    if margen < 0:
+        raise ValueError(f"power_margin_watts no puede ser negativo: {step!r}")
+
+    promedio = str(step.get("power_avg", "3s"))
+    if promedio not in _TARGETS_POTENCIA:
+        raise ValueError(f"power_avg debe ser uno de {sorted(_TARGETS_POTENCIA)}, no {promedio!r}")
+
+    centro = float(vatios)
+    return _TARGETS_POTENCIA[promedio], centro - margen, centro + margen
+
+
+def _construir_paso(kind: str, step: dict[str, Any], order: int) -> ExecutableStep:
+    """Construye el paso con el fin y el objetivo que toquen. Se arma el
+    ExecutableStep directamente, en vez de usar los helpers de la librería,
+    porque esos fijan el fin por tiempo y no dejan poner botón de vuelta."""
+    fin, valor_fin = _fin_de_paso(step)
+    objetivo, minimo, maximo = _objetivo(step)
+
+    paso = ExecutableStep(
+        stepOrder=order,
+        stepType=_STEP_TYPES[kind],
+        endCondition=fin,
+        endConditionValue=valor_fin,
+        targetType=objetivo,
+    )
+    if minimo is not None:
+        # targetValueOne/Two es como Garmin guarda el rango del objetivo,
+        # confirmado leyendo una plantilla real con objetivo de ritmo.
+        # ExecutableStep acepta campos extra (extra="allow"), así que llegan
+        # tal cual al JSON que se sube.
+        paso.targetValueOne = minimo
+        paso.targetValueTwo = maximo
+    texto = step.get("text")
+    if texto:
+        paso.description = str(texto)
+    return paso
 
 
 def _build_steps(
@@ -102,10 +199,8 @@ def _build_steps(
                     weight_kg=step.get("weight_kg"),
                 )
             )
-        elif kind == "interval":
-            built.append(_build_interval(step, next(order_counter)))
-        elif kind in _TIMED_STEP_BUILDERS:
-            built.append(_TIMED_STEP_BUILDERS[kind](_duration_seconds(step), next(order_counter)))
+        elif kind in _STEP_TYPES:
+            built.append(_construir_paso(kind, step, next(order_counter)))
         else:
             raise ValueError(f"Tipo de paso desconocido: {kind!r}")
     return built
@@ -119,6 +214,8 @@ def _estimated_duration_seconds(steps: list[dict[str, Any]]) -> int:
             total += int(step["count"]) * _estimated_duration_seconds(step["steps"])
         elif kind == "strength_set":
             continue  # basado en repeticiones, no en tiempo
+        elif step.get("lap_button"):
+            continue  # lo decide el deportista en el momento, no se puede estimar
         elif "duration_seconds" in step:
             total += float(step["duration_seconds"])
         # pasos por distancia: duración desconocida sin el ritmo del atleta, se ignoran
