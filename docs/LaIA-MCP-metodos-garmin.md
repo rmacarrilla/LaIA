@@ -2,7 +2,7 @@
 
 Especificación de qué métodos de `python-garminconnect` (v0.3.15) usa el conector LaIA, agrupados en las herramientas con las que un entrenador conversa sobre planificación, análisis y ajuste de entrenos. Cada decisión está verificada contra una cuenta real: estructura de datos comprobada campo a campo, y el ciclo completo de escritura (crear, leer, agendar, desagendar, modificar, borrar) probado de principio a fin con un entreno desechable de resistencia (`RunningWorkout`). Ya no queda ninguna excepción: `upload_strength_workout` también ha pasado la prueba controlada (crear, releer campo a campo, agendar, desagendar y borrar con `StrengthWorkout`). El objetivo de potencia estructurado para los intervalos de rodillo y el fin de paso por botón de vuelta **sí están verificados** contra la cuenta real (ver más abajo). En carrera no se usa ningún objetivo con alerta sonora — el ritmo va en texto legible en el paso, nunca como `PACE_ZONE`.
 
-De 153 métodos públicos de la librería, **33 se usan**. El resto queda fuera por un motivo concreto y verificado, no por descarte a ojo.
+De 153 métodos públicos de la librería, **44 se usan** (40 de lectura y escritura más los 4 `upload_*_workout`, uno por deporte). El resto queda fuera por un motivo concreto y verificado, no por descarte a ojo.
 
 ---
 
@@ -14,35 +14,35 @@ La identidad del deportista **no es un parámetro de ninguna tool**. Sale del to
 
 **Regla general de fallos parciales:** cada una de las cinco herramientas de lectura agrupa varias llamadas a Garmin. Si una de ellas falla (por ejemplo, el deportista no llevó el reloj esa noche y `get_body_battery` no devuelve nada) mientras las demás funcionan, la tool devuelve los datos que sí obtuvo más un campo `advertencias` listando qué no se pudo traer y por qué. Una tool no debe fallar entera por el fallo de una sola llamada interna, salvo que todas fallen.
 
-### `estado(dias=7)` — cómo está el deportista hoy y esta semana
+### `estado(dias=7, spo2_detalle=False)` — cómo está el deportista hoy y esta semana
 
 Primera llamada de cualquier conversación sobre si puede entrenar fuerte, cómo viene durmiendo, o cómo lleva la semana. Se refresca siempre, sin caché de larga duración.
 
 Envuelve: `get_morning_training_readiness`, `get_body_battery`, `get_sleep_data` (del último día), `get_sleep_daily` (del rango), `get_stats`, `get_training_status`, `get_activities_by_date` (del rango, con carga y zonas de FC ya incluidas en cada actividad).
 
-La tool no devuelve el JSON crudo de `get_activities_by_date` (110+ campos por actividad): de cada actividad solo pasan a la respuesta los campos que las herramientas 2 a 6 de este documento usan (carga, zonas de FC, RPE si ya está cacheado, tipo de deporte, duración, distancia). El resto se descarta antes de responder.
+La tool no devuelve las respuestas crudas de Garmin. Lo que se descarta está declarado por **lista negra, no por lista blanca**: fuera las series punto a punto (sueño minuto a minuto, body battery intradía, SpO2 por época), los metadatos de subida del fichero (`metadataDTO`), el agregado por tramo (`splitSummaries`) y los datos del dueño de la cuenta. Se eligió quitar lo que sobra en vez de enumerar lo que se queda porque una lista blanca sobre 110+ campos por actividad es una forma silenciosa de perder un dato útil el día que Garmin añada uno. El resultado medido llega al mismo sitio: `estado(7)` pasó de 241 KB a 28 KB, `carga(10 días)` de 121 a 57 y `sesion()` de 28 a 21.
 
 **Campos que la curación no puede perder, por venir anidados y ser fáciles de descartar por error al aplanar la respuesta:**
 - De `get_training_status`: `mostRecentTrainingStatus.trainingStatusFeedbackPhrase` (la etiqueta PRODUCTIVE/PEAKING/OVERREACHING/DETRAINING) y `mostRecentTrainingStatus.trainingStatus` (su código numérico). Es un dato distinto del Training Readiness y del Endurance Score, y no tiene sustituto en ningún otro método de los seleccionados.
 - De cada entrada de `get_sleep_daily`: el campo `spO2` (media de saturación de oxígeno de esa noche), además de `restingHeartRate`, `avgOvernightHrv`, `hrvStatus` y `bodyBatteryChange`, que ya se mencionan en el bloque 2 pero conviene remarcar aquí porque son justo los que se pierden si se aplana la lista solo pensando en sueño.
 
-**Disparador para pedir detalle de SpO2:** si el `spO2` medio de algún día de `get_sleep_daily` baja de un umbral (por ejemplo, 92%) o el usuario pregunta explícitamente por saturación de oxígeno o desaturación nocturna, `estado()` llama además a `get_spo2_data(cdate)` para ese día concreto — ver la entrada correspondiente en el bloque 2, ahora condicional en vez de descartada.
+**Disparador para pedir detalle de SpO2:** implementado por dos vías. **Automática**: si el `spO2` medio de alguna noche del rango baja del 92%, `estado()` pide por su cuenta `get_spo2_data` de cada noche y lo anota en `advertencias` — ahí el mínimo deja de ser un adorno, porque una caída puntual puede no significar nada pero repetida sí. **Manual**: `spo2_detalle=True` lo fuerza aunque ninguna noche baje del umbral, para cuando la pregunta va explícitamente de saturación. Cuesta una llamada por día y por eso no se hace por rutina.
 
 **Descripción para el servidor MCP:**
 > Da el estado actual del deportista: preparación para entrenar hoy (`training readiness`), recuperación (sueño, HRV, body battery), estado de entrenamiento (ACWR, fase, reparto de carga) y las actividades de los últimos `dias` con su carga y reparto de intensidad ya calculado. Úsala siempre como primera llamada ante cualquier pregunta sobre si el deportista puede entrenar fuerte hoy, cómo ha dormido, o cómo lleva la semana. De aquí sale el `activity_id` que necesitan `sesion()` y las herramientas de escritura — no pidas el listado de actividades por otra vía.
 
-### `capacidad(incluir_dispositivo=False)` — de qué es capaz ahora mismo
+### `capacidad(extras=None)` — de qué es capaz ahora mismo
 
 Todo lo que cambia en semanas o meses: umbrales, zonas, FTP, VO2max, predicciones de carrera. Se pide una vez por conversación y se reutiliza durante toda ella; no tiene sentido volver a pedirla si ya se pidió hace diez minutos.
 
 Envuelve: `get_lactate_threshold`, `get_cycling_ftp`, `get_heart_rate_zones`, `get_power_zones_for_sport` (una llamada por deporte relevante), `get_max_metrics_range`, `get_endurance_score`, `get_race_predictions`, `get_user_profile`.
 
-Bajo demanda dentro de esta misma herramienta, solo si la pregunta lo pide explícitamente: `get_functional_threshold_power_range` (progresión de FTP), `get_personal_record` (récords), `get_hill_score` (solo con desnivel relevante en la pregunta), `get_fitnessage_data` (solo si se pregunta por la "edad de forma física").
+Bajo demanda, pasando los nombres en la lista `extras`, solo si la pregunta lo pide explícitamente: `"ftp_progresion"` (`get_functional_threshold_power_range`, últimos 6 meses de carrera y bici), `"records"` (`get_personal_record`), `"hill_score"` (solo con desnivel relevante en la pregunta), `"edad_forma"` (`get_fitnessage_data`), `"peso"` (`get_body_composition`, 90 días) y `"dispositivo"`. Un nombre que no esté en esa lista se rechaza con un error que enumera los válidos, en vez de ignorarse en silencio.
 
-Con `incluir_dispositivo=True`, además `get_devices`, filtrado a un puñado de campos derivados (por ejemplo `running_tolerance_capable`, `solar_capable`) antes de devolverlo — nunca los más de 250 campos crudos. Se usa antes de decidir si tiene sentido llamar a `get_running_tolerance` para ese deportista en concreto. Este dato cambia solo si el deportista cambia de reloj, así que conviene cachearlo por separado con una caducidad mucho más larga (semanas) que el resto de `capacidad()`, para que pedir el flag no fuerce refrescar todo lo demás.
+`"dispositivo"` trae `get_devices` resumido a un puñado de flags legibles (`tolerancia_de_carrera`, `datos_solares`, `hrv`, `spo2_nocturno`, `zonas_de_potencia_bici`...) junto al nombre y el firmware del reloj — nunca los más de 250 campos crudos. Y sirve para lo que se pensó: en esa misma llamada, y **solo si el reloj declara soportarlos**, se piden además `get_running_tolerance` y `get_device_solar_data`; nunca a ciegas. No se cachea aparte con caducidad de semanas como se planteó: `capacidad()` entera ya se pide una sola vez por conversación, así que el ahorro sería teórico y la caché una pieza más que mantener.
 
 **Descripción para el servidor MCP:**
-> Da la capacidad física actual del deportista: umbrales de FC y ritmo, FTP, zonas de FC y potencia, tendencia de VO2max, endurance score y predicciones de carrera. No cambia de una conversación a otra: llámala una sola vez por conversación y reutiliza el resultado, no vuelvas a pedirla si ya la tienes. Pasa `incluir_dispositivo=True` solo si necesitas saber qué puede hacer el reloj del deportista antes de usar una función que depende del hardware.
+> Da la capacidad física actual del deportista: umbrales de FC y ritmo, FTP, zonas de FC y potencia, tendencia de VO2max, endurance score y predicciones de carrera. No cambia de una conversación a otra: llámala una sola vez por conversación y reutiliza el resultado, no vuelvas a pedirla si ya la tienes. Pasa `extras=[...]` solo si la pregunta lo pide: `"peso"`, `"records"`, `"ftp_progresion"`, `"hill_score"`, `"edad_forma"`, o `"dispositivo"` si necesitas saber qué puede hacer el reloj antes de usar algo que dependa del hardware.
 
 ### `carga(inicio, fin)` — qué se ha entrenado en un rango
 
@@ -53,16 +53,16 @@ Envuelve: `get_activities_by_date` (ya trae carga, zonas de FC, TSS e IF de bici
 **Descripción para el servidor MCP:**
 > Analiza un rango de fechas: volumen por disciplina, reparto de intensidad (con la corrección de tiempo suave real, no el reparto crudo de zonas de Garmin), progresión semanal, y sRPE por sesión donde el deportista lo haya registrado. Úsala para revisiones de bloque o de mesociclo, no para preguntas sobre un solo día (para eso usa `estado()`) ni sobre una sola sesión (para eso usa `sesion()`).
 
-### `sesion(activity_id, detalle=False)` — qué pasó en una sesión concreta
+### `sesion(activity_id, detalle=False, potencia_por_zona=False)` — qué pasó en una sesión concreta
 
 Nunca se llama sin un `activity_id` previo, que sale siempre de `estado()` o de `plan()`.
 
-Orden de llamada, con dependencia: primero `get_activity`, para saber el tipo de deporte y extraer RPE/feel. Con el tipo ya conocido, en paralelo `get_activity_splits`, `get_activity_gear`, y `get_activity_typed_splits` solo si el deporte es natación (`lap_swimming` o `open_water_swimming`). Con `detalle=True`, además `get_activity_details` (la serie punto a punto, solo cuando la pregunta es de deriva cardiaca o desacople). Con `get_activity_power_in_timezones` solo si el deporte es de bici y se pregunta específicamente por el reparto de potencia.
+Orden de llamada, con dependencia: primero `get_activity`, para saber el tipo de deporte y extraer RPE/feel. Con el tipo ya conocido, en paralelo `get_activity_splits`, `get_activity_gear`, y `get_activity_typed_splits` solo si el deporte es natación (`lap_swimming` o `open_water_swimming`). Con `detalle=True`, además `get_activity_details` (la serie punto a punto, solo cuando la pregunta es de deriva cardiaca o desacople). Con `potencia_por_zona=True` se añade `get_activity_power_in_timezones`, que solo tiene sentido en bici (en cualquier otro deporte se ignora en vez de fallar) y solo si se pregunta específicamente por ese reparto. Y después de saber qué material se usó —el uuid no se conoce hasta tener la respuesta de `get_activity_gear`— se piden sus kilómetros acumulados con `get_gear_stats`, que es lo que permite cruzar una molestia con unas zapatillas gastadas.
 
 **Descripción para el servidor MCP:**
 > Da el detalle de una sesión concreta a partir de su `activity_id` (nunca inventes un id ni se lo pidas al usuario como número: sácalo de una llamada previa a `estado()` o `plan()`). Incluye splits, RPE, feel y material usado. Pon `detalle=True` solo si la pregunta es sobre deriva cardiaca, desacople, o necesitas la curva segundo a segundo: por defecto no la pidas, es una respuesta mucho más pesada.
 
-### `plan(inicio, fin)` — qué hay agendado y con qué construirlo
+### `plan(inicio, fin, workout_id=None)` — qué hay agendado y con qué construirlo
 
 Junta dos cosas que siempre hacen falta juntas: el calendario y la biblioteca de plantillas, para no crear una plantilla nueva cuando ya existe una parecida.
 
@@ -77,48 +77,137 @@ Cada plantilla de la biblioteca lleva además su origen (`workoutProvider`, `con
 
 Siempre después de leer con `plan()`, y siempre con confirmación explícita del usuario antes de ejecutar. Cualquier escritura invalida la caché de `plan()` para el deportista de la sesión actual.
 
-- **`crear_entreno(deporte, nombre, pasos, agendar_fecha=None)`**: `upload_running_workout` / `upload_cycling_workout` / `upload_swimming_workout` / `upload_strength_workout`, según el deporte. Cada paso de resistencia se construye con el modelo tipado de la librería (`ExecutableStep`). Los pasos de fuerza usan los helpers propios de la librería (`create_strength_exercise_step`, `create_strength_rest_step`, `create_strength_set`), con series y repeticiones en vez de tiempo o distancia. **Fuerza no tiene día fijo en el plan semanal actual, pero se mantiene como opción**, útil por ejemplo para trabajo específico de fortalecimiento mientras dure la sobrecarga de sóleo. A diferencia de los otros tres deportes, `upload_strength_workout` no ha pasado por la prueba controlada de escritura: esa prueba se hizo con `RunningWorkout`. Antes de usarlo en producción, hay que repetirla cambiando `RunningWorkout` por `StrengthWorkout`.
+- **`crear_entreno(sport, name, steps, agendar_fecha=None)`**:
+  `upload_running_workout` / `upload_cycling_workout` /
+  `upload_swimming_workout` / `upload_strength_workout`, según `sport`
+  (`"running"`, `"cycling"`, `"swimming"`, `"strength"`). Con `agendar_fecha`
+  (YYYY-MM-DD) además la deja puesta en el calendario en la misma llamada y
+  devuelve el `scheduled_workout_id`, que es lo normal cuando el entreno es
+  para un día concreto; sin ella se queda solo en la biblioteca.
 
-  **Carrera: fin de paso por botón de vuelta, sin objetivo con alerta sonora.** En las series de pista y las salidas de grupo, el paso termina con `ConditionType.LAP_BUTTON` (clave real `"lap.button"`, confirmada). El deportista no quiere el pitido continuo de un objetivo de ritmo con alerta (`PACE_ZONE`): se guía por el ritmo medio de vuelta que ya ve en pantalla. Lo único que hace falta es que el ritmo objetivo quede legible en el propio paso —el texto que el reloj muestra al empezar el intervalo, cuando suena el pitido de cambio de paso— para saber a qué ritmo correr sin depender de una alerta. **Verificado**: ese campo existe y es `description` dentro de cada paso (distinto del `description` de la plantilla entera). Se sube y se relee intacto — comprobado creando una plantilla con `{"text": "Serie 1000m a 4:30/km"}` por paso y releyéndola con `get_workout_by_id`. Lo que **no** se puede verificar por API es si el reloj concreto lo muestra en pantalla al arrancar el paso: eso es comportamiento del dispositivo y solo se confirma usándolo.
+  Cada paso es un dict con `kind` (`"warmup"`, `"cooldown"`, `"recovery"`,
+  `"interval"`, `"repeat"` o `"strength_set"`) y **termina de una de tres
+  formas**: `duration_seconds`, `distance_meters` o `lap_button: true`.
 
-  **Rodillo: potencia estructurada, con margen ensanchado a mano, no la zona configurada en Garmin.** Los intervalos de rodillo sí llevan `TargetType.POWER_ZONE`, con `targetValueOne` (mínimo) y `targetValueTwo` (máximo). La zona de potencia que ya tiene el deportista configurada en `get_power_zones_for_sport` es demasiado estrecha para esto: la lectura de potencia a 3-10 segundos oscila, y un margen ajustado provoca pitidos constantes aunque la media del intervalo esté bien. El rango se calcula como el vatiaje objetivo en el centro, ensanchado por un margen que decide el entrenador para ese intervalo (por ejemplo, objetivo 220 W con margen de 20 W → rango 200-240 W), no como referencia a una zona ya guardada. **Verificado contra la cuenta real**: `targetValueOne`/`targetValueTwo` son los nombres correctos y Garmin acepta el rango calculado a mano (se subió un paso de 220 W con margen de 20 y se releyó como 200-240).
+  **Carrera: fin de paso por botón de vuelta, sin objetivo con alerta sonora.**
+  En las series de pista y las salidas de grupo el paso termina con
+  `lap_button`, que se traduce a `ConditionType.LAP_BUTTON` (clave real
+  `"lap.button"`, `conditionTypeId` 1, confirmada contra el catálogo). El
+  deportista no quiere el pitido continuo de un objetivo de ritmo con alerta
+  (`PACE_ZONE`): se guía por el ritmo medio de vuelta que ya ve en pantalla.
+  El ritmo objetivo va como texto en el propio paso, con `text`, que se
+  guarda en el campo `description` **del paso** (distinto del `description`
+  de la plantilla entera). **Verificado**: ese campo existe, se sube y se
+  relee intacto. Lo que **no** se puede verificar por API es si el reloj lo
+  muestra en pantalla al arrancar el paso — eso es comportamiento del
+  dispositivo y solo se confirma usándolo.
 
-  **Además, el catálogo ofrece algo mejor que ensanchar el rango a mano.** Junto a `power.zone` (id 2, potencia instantánea) existen `power.3s` (10), `power.10s` (11) y `power.30s` (12): el mismo rango, pero comparado contra la potencia **promediada** a esos segundos. Eso ataca en origen el problema que motivaba el margen ancho — la oscilación de la lectura instantánea — en vez de compensarlo estirando los límites. El conector usa `power.3s` por defecto y deja elegir con `power_avg`; el margen sigue existiendo y es compatible con ambas cosas.
+  **Rodillo: potencia estructurada.** Los intervalos de rodillo llevan
+  objetivo de potencia con `power_watts` (centro) y `power_margin_watts`
+  (margen): 220 W con margen 20 se traduce a `targetValueOne` 200 y
+  `targetValueTwo` 240. Se calcula a mano en vez de referenciar la zona que
+  el deportista tiene configurada, que es demasiado estrecha para un
+  intervalo. **Verificado contra la cuenta real**, nombres de campo
+  incluidos.
 
-  Este mismo mecanismo de potencia estructurada no se ha pedido para las salidas de bici en carretera (domingo): por ahora se trata como carrera, con el objetivo en texto, salvo que en algún momento se pida explícitamente lo contrario.
-- **`modificar_entreno(workout_id, cambios)`**: `update_workout`, mandando siempre la estructura completa devuelta por `get_workout_by_id` con el cambio aplicado. El `workoutId` no cambia, así que lo ya agendado no se rompe.
-- **`agendar(workout_id, fecha)`**: `schedule_workout`.
-- **`desagendar(scheduled_workout_id)`** (uno) **o `desagendar_en_bloque(filtro)`** (varios): `unschedule_workout` repetido sobre el conjunto que resulte del filtro.
-- **`borrar_entreno(workout_id)`** (uno) **o `borrar_entreno_en_bloque(filtro)`** (varios): `delete_workout` repetido sobre el conjunto que resulte del filtro.
+  **Y hay algo mejor que ensanchar el margen.** El catálogo no solo tiene
+  `power.zone` (id 2, potencia instantánea) sino `power.3s` (10), `power.10s`
+  (11) y `power.30s` (12): el mismo rango, pero comparado contra la potencia
+  **promediada** a esos segundos. Eso ataca en origen el problema que
+  motivaba el margen ancho —la oscilación de la lectura instantánea— en vez
+  de compensarlo estirando los límites. El conector usa `power.3s` por
+  defecto y deja elegir con `power_avg` (`"3s"`, `"10s"`, `"30s"` o
+  `"instantanea"`); el margen sigue existiendo y es compatible con ambos.
 
-**Patrón obligatorio de dos pasos para las variantes en bloque.** Existen porque en la práctica se han acumulado plantillas huérfanas de una integración o carga anterior (48 en el caso conocido), y pedir confirmación una por una para ese volumen es inviable — es probablemente la razón por la que se acumularon sin limpiar. Pero un borrado o desagendado masivo sigue siendo una acción irreversible, así que nunca se ejecuta en una sola llamada a partir de una instrucción de conversación:
-1. Primero se resuelve el filtro (por `workoutProvider`, `consumer`, o una lista explícita de ids) contra `plan()` y se devuelve la lista exacta de plantillas o instancias que coinciden, con su nombre y origen, sin tocar nada todavía.
-2. Solo una segunda llamada explícita, referida a ese mismo conjunto ya mostrado (por ejemplo, pasando los ids exactos de la respuesta anterior, no el filtro de nuevo), ejecuta el borrado o el desagendado.
+  **Fuerza.** `strength_set` monta un bloque completo (series × (repeticiones
+  + descanso)) con `create_strength_set`: el paso de ejercicio termina por
+  `reps`, no por tiempo, y el de descanso es de tipo `rest`. **Verificado con
+  la prueba controlada**, repetida con `StrengthWorkout`: se sube, se relee
+  campo a campo, se agenda, se desagenda y se borra igual que el resto. La
+  duración estimada se sube como 0 y Garmin la acepta sin problema — la
+  fuerza se mide en repeticiones, no en tiempo. Ojo al peso, que tiene su
+  propia trampa de unidades: ver la sección 4.
 
-El filtro tiene que ser un campo concreto (origen, o una lista de ids), nunca una descripción ambigua tipo "las plantillas viejas". Si la instrucción del usuario es ambigua, la herramienta de escritura no debe inferir el filtro por su cuenta: se le pide al usuario que lo concrete antes de pasar al paso 1.
+- **`modificar_entreno(workout_id, sport=None, name=None, steps=None)`**:
+  `update_workout`. **Parte siempre de la estructura real que devuelve
+  `get_workout_by_id`** y le aplica encima solo lo que se pase: renombrar es
+  `modificar_entreno(id, name="...")`, sin reenviar los pasos. El `workoutId`
+  no cambia, así que lo ya agendado no se rompe. Reconstruir la plantilla
+  entera desde cero, como se hacía antes, obligaba a reenviarlo todo para
+  cambiar una palabra y —peor— borraba en silencio cualquier cosa de la
+  plantilla que el esquema de pasos no sepa expresar.
 
-**Descripción para el servidor MCP (las cinco herramientas de un solo entreno comparten esta base, adaptando el verbo):**
-> Modifica de verdad el calendario o la biblioteca de entrenos del deportista en Garmin Connect. Antes de llamarla, confirma explícitamente con el usuario qué se va a crear, modificar, agendar, desagendar o borrar — nunca la ejecutes solo porque la conversación lo sugiere de forma ambigua. Llama siempre a `plan()` justo antes para leer el estado actual del calendario.
+- **`agendar(workout_id, date)`**: `schedule_workout`.
 
-**Descripción para el servidor MCP (variantes en bloque):**
-> Desagenda o borra varias plantillas o instancias a la vez, identificadas por un filtro explícito (origen o lista de ids), nunca por una descripción vaga. Se usa en dos pasos: primero pide sin `confirmar=True` para ver el listado exacto de lo que coincide con el filtro, sin tocar nada; solo cuando el usuario haya confirmado esa lista concreta, repite la llamada con `confirmar=True` y los mismos ids para ejecutar. No la uses nunca en un solo paso a partir de una instrucción ambigua como "borra las plantillas viejas".
+- **`desagendar(scheduled_workout_ids=None, start_date=None, end_date=None,
+  exclude_ids=None)`** y **`borrar_entreno(workout_ids=None, source=None)`**:
+  `unschedule_workout` y `delete_workout`. Cada una tiene dos modos y **solo
+  uno ejecuta**:
+  - **Por ids** (`scheduled_workout_ids`, `workout_ids`): actúa, sobre esos
+    y solo esos.
+  - **Por filtro** (rango de fechas, u `source` para el origen de la
+    plantilla): **no toca nada**. Devuelve la lista concreta de lo que
+    coincide, con nombre y origen, para enseñársela al usuario. El segundo
+    paso se hace pasando los ids de esa respuesta.
 
-### Configuración global — se carga una vez al arrancar el servicio, no depende del deportista
+**Por qué el filtro no ejecuta.** Existe porque en la práctica se acumulan
+plantillas huérfanas de una integración anterior (48 en el caso conocido) y
+confirmar una por una para ese volumen es inviable — probablemente por eso se
+acumularon sin limpiar. Pero un borrado masivo es irreversible, y en el
+diálogo de aprobación lo que se ve es el filtro, no su alcance: "las de
+Shape" pueden ser 3 o 38. Partiéndolo en dos, lo que se aprueba es la lista
+concreta y no la regla que la genera.
 
-Dos catálogos de Garmin que no cambian según quién pregunta, así que no hace falta guardarlos por usuario ni en una tabla de base de datos: basta con cargarlos una vez en memoria cuando arranca el proceso (un valor cacheado a nivel de servicio, no de deportista) y que las herramientas lean ese valor ya cargado.
+Se implementó **sin el parámetro `confirmar=True`** que se planteó al
+principio: la forma misma de la API ya obliga a los dos pasos (por filtro no
+se puede borrar, punto), y un booleano de confirmación es justo lo que un
+modelo aprende a poner siempre por costumbre, con lo que dejaría de proteger
+nada. El filtro sigue teniendo que ser un campo concreto —origen o lista de
+ids—, nunca una descripción ambigua tipo "las plantillas viejas"; si la
+instrucción del usuario es vaga, la herramienta debe pedir que la concrete en
+vez de inferirla.
 
-| Método | Cuándo se pide | Para qué lo usan las herramientas |
+**Descripción para el servidor MCP (escritura de un solo entreno):**
+> Modifica de verdad el calendario o la biblioteca de entrenos del deportista
+> en Garmin Connect. Antes de llamarla, confirma explícitamente con el usuario
+> qué se va a crear, modificar, agendar, desagendar o borrar — nunca la
+> ejecutes solo porque la conversación lo sugiere de forma ambigua. Llama
+> siempre a `plan()` justo antes para leer el estado actual del calendario.
+
+### Catálogos de Garmin: por qué al final no hay ninguno cargado en memoria
+
+Se planteó cargar al arrancar el servicio dos catálogos que son iguales para
+todo el mundo. Al implementarlo, ninguno de los dos acabó haciendo falta, y
+conviene dejar escrito por qué para no volver a proponerlo:
+
+| Catálogo | Qué se pensó | Qué pasó de verdad |
 |---|---|---|
-| `get_activity_types` | Una vez, al arrancar el servicio | Traducir el `sportTypeId` o `typeKey` que aparece en las respuestas de `estado()`, `carga()` y `sesion()`, sin tener que llamarlo cada vez. |
-| Catálogo de tipos de entreno (`connectapi("/workout-service/workout/types")`) | Una vez, al arrancar el servicio | De ahí sale la clave de texto real de cada condición de fin de paso (la del botón de vuelta es `conditionTypeKey: "lap.button"`, confirmada contra la cuenta real) y de cada tipo de objetivo. Sin este catálogo cargado, `crear_entreno` no puede construir el paso de botón de vuelta sin adivinar la clave. |
+| Tipos de entreno (`connectapi("/workout-service/workout/types")`) | Sacar de ahí la clave real de cada condición de fin de paso y de cada tipo de objetivo, para no adivinarlas | Se pidió **una vez, durante el desarrollo**, y de ahí salieron los valores exactos que hoy están como constantes en `workout_builder.py`: `lap.button` es `conditionTypeId` 1, `power.zone` es `workoutTargetTypeId` 2, `power.3s` el 10. No se adivinó nada. Pedirlo en tiempo de ejecución añadiría una llamada de red a cada creación de entreno para releer constantes que no cambian. |
+| `get_activity_types` | Traducir el `sportTypeId` que aparece en las respuestas | **Redundante**: cada actividad ya trae su `typeKey` legible inline (`"indoor_cycling"`, `"lap_swimming"`), tanto en `get_activities_by_date` como en `get_activity`. El catálogo traduciría a lo que ya viene puesto. Se llegó a implementar la caché y se retiró al comprobar que nadie la llamaba. |
 
-Ninguno de los dos está descartado: los dos se usan, solo que no forman parte del cuerpo de ninguna de las cinco herramientas de conversación ni dependen de qué deportista pregunta, así que no necesitan tabla ni caché por usuario — con un singleton en memoria del propio servicio basta.
+Además, cargarlos "al arrancar el servicio" no era posible tal cual: pedir
+cualquiera de los dos exige una sesión de Garmin autenticada, y al arrancar
+el proceso todavía no hay ninguna — las sesiones son por deportista y
+aparecen cuando alguien llama. Habría tenido que ser una caché perezosa de
+proceso, no una carga de arranque.
 
 ### Nota sobre `list_workout_templates`
 
-`list_workout_templates` ya no es una utilidad aparte: la lectura (filtrar por `workoutProvider` o `consumer`) está integrada en `plan()`, como se describe más arriba, porque es información de solo lectura sin riesgo. La parte de esta lógica que sí requería una salvaguarda — el borrado o desagendado en bloque a partir de ese filtro — está resuelta en `desagendar_en_bloque` y `borrar_entreno_en_bloque`, con el patrón obligatorio de dos pasos descrito en la sección de escritura. No queda ninguna pieza de esta lógica fuera del MCP ni sin la confirmación explícita que exige cualquier acción irreversible.
+No es una utilidad aparte ni una tool: es una función interna de
+`training_data.py` que pagina `get_workouts` y le añade a cada plantilla su
+origen legible. La usa `plan()` para devolver la biblioteca, y el modo por
+origen de `borrar_entreno` para resolver qué coincide con un filtro.
 
----
+El origen merece una nota: `get_workouts` no trae el nombre legible, solo
+`workoutProvider` (una clave corta) y `consumer` (un UUID). El nombre que se
+enseña —`"prod_athletedata"`, `"Shape Calendar"`, `"Strava"`— vive en
+`consumerName` y **solo aparece en `get_workout_by_id`**. Pedir el detalle de
+cada plantilla sería una llamada por plantilla; en su lugar se pide una sola
+vez por cada combinación distinta de `(workoutProvider, consumer)`, porque
+todas las plantillas del mismo proveedor comparten consumer. Las creadas a
+mano o por el propio conector caen en la combinación `(None, None)` y salen
+con `source: null` — lo que además las hace inalcanzables por el modo de
+borrado por origen, que exige un valor concreto.
 
 ## 2. Métodos incluidos, por qué
 
@@ -151,7 +240,7 @@ Ninguno de los dos está descartado: los dos se usan, solo que no forman parte d
 | `get_personal_record` *(bajo demanda)* | Récords guardados; requiere una tabla propia de traducción de `typeId`, porque Garmin no envía la etiqueta. |
 | `get_hill_score` *(bajo demanda, solo con desnivel relevante)* | Capacidad en terreno con subidas. |
 | `get_fitnessage_data` *(bajo demanda)* | Edad de forma física con su desglose de componentes; se deriva del VO2max pero añade contexto de progreso. |
-| `get_devices` *(bajo demanda, `capacidad(incluir_dispositivo=True)`)* | Más de 250 campos de capacidad del dispositivo, filtrados a un puñado de campos derivados. Sirve para saber qué puede y qué no puede el reloj concreto de cada deportista antes de intentar leer algo que depende del hardware, como `get_running_tolerance`. |
+| `get_devices` *(bajo demanda, `capacidad(extras=["dispositivo"])`)* | Más de 250 campos de capacidad del dispositivo, resumidos a un puñado de flags legibles. Sirve para saber qué puede y qué no puede el reloj de cada deportista antes de intentar leer algo que depende del hardware, como `get_running_tolerance` — que se pide en esa misma llamada solo si el reloj lo declara. |
 
 ### Actividades (dentro de `carga()` y `sesion()`)
 
@@ -170,7 +259,7 @@ Ninguno de los dos está descartado: los dos se usan, solo que no forman parte d
 | Método | Por qué entra |
 |---|---|
 | `get_activity_gear` | Ya listado arriba. |
-| `get_gear_stats` *(bajo demanda)* | Kilómetros acumulados de una zapatilla o bici concreta, para cruzar con sobrecargas. |
+| `get_gear_stats` | Kilómetros acumulados de la zapatilla o bici usada. `sesion()` lo pide siempre que la sesión tenga material asignado, en un segundo paso: el uuid del material no se conoce hasta tener la respuesta de `get_activity_gear`. |
 
 ### Entrenamientos estructurados y calendario
 
@@ -190,8 +279,8 @@ Ninguno de los dos está descartado: los dos se usan, solo que no forman parte d
 
 | Método | Por qué entra |
 |---|---|
-| `get_body_composition` *(bajo demanda, consulta semanal)* | Peso a lo largo del tiempo, relevante para potencia relativa e impacto por zancada. |
-| `get_device_last_used` *(bajo demanda, diagnóstico)* | Explica por qué falta un dato de un día concreto: si el reloj no se llevó por la noche, no hay HRV, y conviene distinguir eso de un HRV realmente malo. |
+| `get_body_composition` *(bajo demanda, `capacidad(extras=["peso"])`)* | Peso de los últimos 90 días, relevante para potencia relativa e impacto por zancada. |
+| `get_device_last_used` *(automático, solo si hay advertencias)* | Explica por qué falta un dato: si el reloj no se llevó puesto o no ha sincronizado, no hay HRV, y distinguir eso de un HRV realmente malo cambia la lectura entera. `estado()` lo añade solo cuando ya hay algo que explicar, no en cada llamada. |
 
 ---
 
@@ -213,7 +302,7 @@ Ninguno de los dos está descartado: los dos se usan, solo que no forman parte d
 
 **No existe en esta versión de la librería.** `get_next_scheduled_workout` da error de atributo. Si hace falta "la próxima sesión sin especificar mes", se calcula filtrando `get_scheduled_workouts` del mes actual y el siguiente por fecha.
 
-**Depende del dispositivo, no de la cuenta.** `get_running_tolerance` y `get_device_solar_data` dependen de que el reloj del deportista soporte esas funciones. Se llaman condicionalmente según lo que declare `capacidad(incluir_dispositivo=True)` (ver sección 1), nunca a ciegas.
+**Depende del dispositivo, no de la cuenta.** `get_running_tolerance` y `get_device_solar_data` dependen de que el reloj soporte esas funciones. **Implementado**: `capacidad(extras=["dispositivo"])` mira primero los flags del reloj y solo entonces los pide, nunca a ciegas. En el Forerunner 965 de la cuenta de prueba ninguno de los dos está declarado, así que no se piden.
 
 ---
 
@@ -251,9 +340,14 @@ Las trampas de unidades de esta tabla se verificaron por **coherencia entre camp
 | "Planifica la semana" | `estado(14)` → `capacidad()` → `plan(semana)` | 3 |
 | "Analiza la sesión de ayer" | `estado(7)` para sacar el `activity_id` → `sesion(activity_id)` | 2 |
 | "¿Por qué se me fue la FC en la tirada larga?" | `estado(7)` → `sesion(activity_id, detalle=True)` | 2 |
-| "Cambia el entreno del jueves" | `plan(semana)` → `desagendar` → `modificar_entreno` o `crear_entreno` → `agendar` | 4 |
+| "Ponme el entreno del jueves" | `plan(semana)` → `crear_entreno(..., agendar_fecha="jueves")` | 2 |
+| "Cambia el entreno del jueves" | `plan(semana, workout_id=...)` → `modificar_entreno(id, steps=[...])` | 2 |
+| "Muévelo al viernes" | `plan(semana)` → `desagendar(scheduled_workout_ids=[...])` → `agendar(workout_id, viernes)` | 3 |
+| "Limpia las plantillas de Shape" | `plan(mes)` → `borrar_entreno(source="Shape")` *(solo lista)* → confirmar → `borrar_entreno(workout_ids=[...])` | 3 |
 | "Revisa el bloque / planifica el mesociclo" | `estado(28)` → `capacidad()` → `carga(8 semanas)` → `plan(mes)` | 4 |
 | "¿Cómo voy de forma?" | `capacidad()` → `carga(12 semanas)` | 2 |
 
-Reglas fijas: `capacidad()` no se repite dentro de una misma conversación. `sesion()` nunca se llama sin un `activity_id` obtenido antes. La serie punto a punto (`detalle=True`) solo se pide cuando la pregunta es de deriva o desacople. Ninguna escritura se hace sin haber leído antes `plan()`, y cualquier escritura invalida la caché de `plan()` para esa fecha.
+Reglas fijas: `capacidad()` no se repite dentro de una misma conversación. `sesion()` nunca se llama sin un `activity_id` obtenido antes. La serie punto a punto (`detalle=True`) solo se pide cuando la pregunta es de deriva o desacople. Ninguna escritura se hace sin haber leído antes `plan()`, y cualquier escritura invalida lo leído para esa fecha: si se encadena otro cambio en el mismo rango, hay que volver a llamar a `plan()`.
+
+Todas estas reglas viven en el docstring de cada tool, no en este documento: son lo único que ve un modelo que use el conector sin haber leído nada más. Este documento explica el porqué; las descripciones de las tools son las que se cumplen.
 

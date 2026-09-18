@@ -34,34 +34,6 @@ _FEEDBACK_PHRASES: dict[str, str] = {}
 _RECORD_TYPE_LABELS: dict[int, str] = {}
 
 
-# El catálogo de tipos de actividad es idéntico para todo el mundo, así que se
-# cachea a nivel de proceso y no por deportista. No se puede cargar al
-# arrancar el servicio, como sería lo ideal: pedirlo exige una sesión de
-# Garmin autenticada y al arrancar todavía no hay ninguna. Se carga en la
-# primera llamada que lo necesite y ya se queda.
-_CATALOGO_ACTIVIDADES: dict[int, str] | None = None
-_CATALOGO_LOCK = asyncio.Lock()
-
-
-async def catalogo_de_actividades(client: Garmin) -> dict[int, str]:
-    """typeId -> typeKey de Garmin. Un fallo aquí no debe tumbar una lectura:
-    sin catálogo se devuelve vacío y quien lo use se queda con el typeKey que
-    ya viene en cada actividad."""
-    global _CATALOGO_ACTIVIDADES
-    if _CATALOGO_ACTIVIDADES is not None:
-        return _CATALOGO_ACTIVIDADES
-    async with _CATALOGO_LOCK:
-        if _CATALOGO_ACTIVIDADES is None:
-            try:
-                tipos = await asyncio.to_thread(client.get_activity_types)
-                _CATALOGO_ACTIVIDADES = {
-                    t["typeId"]: t["typeKey"] for t in tipos if t.get("typeId") and t.get("typeKey")
-                }
-            except Exception:
-                _CATALOGO_ACTIVIDADES = {}
-    return _CATALOGO_ACTIVIDADES
-
-
 def _field(activity: dict[str, Any], name: str) -> Any:
     """Las dos formas en que llega una actividad no ponen los mismos campos en
     el mismo sitio, comprobado contra la cuenta real: get_activity (detalle)
