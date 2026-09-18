@@ -81,7 +81,8 @@ async def estado(dias: int = 7, spo2_detalle: bool = False) -> dict:
 
     spo2_detalle=True añade a cada noche el SpO2 mínimo y máximo, que exige
     una llamada por día — pídelo solo cuando estés investigando una bajada
-    concreta, no por rutina."""
+    concreta. No hace falta pedirlo por rutina: si alguna noche baja del 92%
+    de media, se añade solo y se avisa en `advertencias`."""
     client = await _client_for_current_user()
     return await training_data.estado(client, dias, spo2_detalle)
 
@@ -101,8 +102,10 @@ async def capacidad(extras: list[str] | None = None) -> dict:
     cycling — útil en revisión de bloque), "records" (récords personales),
     "hill_score" (capacidad en terreno con subidas — solo si hay desnivel
     relevante en la pregunta), "edad_forma" (edad de forma física, solo si se
-    pregunta por ella), "dispositivo" (capacidades del reloj — respuesta
-    grande; se pide una vez al conectar la cuenta, no en cada conversación)."""
+    pregunta por ella), "peso" (evolución del peso en 90 días, para potencia
+    relativa o impacto por zancada), "dispositivo" (qué sabe hacer el reloj,
+    resumido en flags; con él se piden además, y solo si el reloj los
+    soporta, tolerancia de carrera y datos solares)."""
     client = await _client_for_current_user()
     return await training_data.capacidad(client, extras)
 
@@ -128,7 +131,10 @@ async def sesion(activity_id: int, detalle: bool = False, potencia_por_zona: boo
     pídelo solo cuando la pregunta sea de deriva cardiaca o desacople, nunca
     por defecto. potencia_por_zona=True trae el reparto de potencia por zona
     — solo tiene sentido en bici (se ignora en cualquier otro deporte) y solo
-    si se pregunta específicamente por ese reparto."""
+    si se pregunta específicamente por ese reparto.
+
+    Incluye el material usado y sus kilómetros acumulados (`gear_stats`),
+    para poder cruzar una molestia con unas zapatillas gastadas."""
     client = await _client_for_current_user()
     return await training_data.sesion(client, activity_id, detalle, potencia_por_zona)
 
@@ -151,11 +157,13 @@ async def plan(inicio: str, fin: str, workout_id: int | None = None) -> dict:
 
 
 @mcp.tool()
-async def crear_entreno(sport: str, name: str, steps: list[dict]) -> dict:
+async def crear_entreno(sport: str, name: str, steps: list[dict], agendar_fecha: str | None = None) -> dict:
     """Crea (sube a la librería de entrenamientos de Garmin) un entrenamiento
-    estructurado por intervalos, sin agendarlo todavía — usa agendar() para
-    ponerlo en una fecha del calendario. Llama antes a plan() para no crear
-    una plantilla casi idéntica a otra que ya existe.
+    estructurado por intervalos. Con `agendar_fecha` (YYYY-MM-DD) lo deja
+    además puesto en esa fecha del calendario en la misma llamada, que es lo
+    normal cuando el entreno es para un día concreto; sin ella se queda solo
+    en la biblioteca y lo pones luego con agendar(). Llama antes a plan()
+    para no crear una plantilla casi idéntica a otra que ya existe.
 
     sport: "running" | "cycling" | "swimming" | "strength".
 
@@ -190,15 +198,25 @@ async def crear_entreno(sport: str, name: str, steps: list[dict]) -> dict:
     desactualizado: vuelve a llamarlo antes del siguiente cambio en el
     mismo rango."""
     client = await _client_for_current_user()
-    return await asyncio.to_thread(workout_builder.upload_workout, client, sport, name, steps)
+    return await asyncio.to_thread(
+        workout_builder.upload_workout, client, sport, name, steps, agendar_fecha
+    )
 
 
 @mcp.tool()
-async def modificar_entreno(workout_id: int, sport: str, name: str, steps: list[dict]) -> dict:
-    """Reemplaza la estructura completa de una plantilla ya existente (mismo
-    esquema de pasos que crear_entreno) conservando su workout_id — lo ya
-    agendado con ella no se rompe. Llama antes a plan(workout_id=...) para
-    partir de la estructura real de la plantilla, no de una suposición.
+async def modificar_entreno(
+    workout_id: int,
+    sport: str | None = None,
+    name: str | None = None,
+    steps: list[dict] | None = None,
+) -> dict:
+    """Modifica una plantilla ya existente conservando su workout_id — lo ya
+    agendado con ella no se rompe.
+
+    Pasa solo lo que quieras cambiar: `name` para renombrarla, `steps` para
+    cambiar su contenido, o ambos. Lo que no pases se queda como está — parte
+    de la estructura real que tiene la plantilla en Garmin, no de cero, así
+    que no hace falta reenviar los pasos para cambiar el nombre.
 
     steps: lista de pasos, cada uno un dict con "kind":
       - "warmup" | "cooldown" | "recovery" | "interval"
@@ -227,6 +245,8 @@ async def modificar_entreno(workout_id: int, sport: str, name: str, steps: list[
     Tras escribir, lo que devolvió plan() para esa fecha queda
     desactualizado: vuelve a llamarlo antes del siguiente cambio en el
     mismo rango."""
+    if sport is None and name is None and steps is None:
+        raise ValueError("Pasa al menos uno de: name, steps, sport")
     client = await _client_for_current_user()
     return await asyncio.to_thread(workout_builder.update_workout, client, workout_id, sport, name, steps)
 
@@ -251,13 +271,19 @@ async def desagendar(
     exclude_ids: list[int] | None = None,
 ) -> dict:
     """Desagenda del calendario de Garmin (sin borrar plantillas — usa
-    borrar_entreno para eso) uno o varios entrenamientos agendados. Llama
-    antes a plan() para saber qué scheduled_workout_id tocar.
+    borrar_entreno para eso) uno o varios entrenamientos agendados.
 
     Dos modos, uno u otro (no combinar):
-      - Por ids: scheduled_workout_ids=[...] (los que da plan()).
+      - Por ids: scheduled_workout_ids=[...] — **esto sí desagenda**, esos y
+        solo esos. Los ids salen de plan() o del modo rango.
       - Por rango: start_date + end_date (YYYY-MM-DD, inclusive; máximo 120
-        días); exclude_ids opcional para no tocar algunas entradas del rango.
+        días), con exclude_ids opcional — **esto NO desagenda nada**: devuelve
+        la lista de lo que hay ahí para que se la enseñes al usuario. Si la
+        confirma, vuelve a llamar con esos ids.
+
+    El rango no desagenda por diseño: un rango de fechas no deja ver cuántas
+    sesiones hay dentro, y quien aprueba la acción tiene derecho a ver la
+    lista concreta antes de que desaparezca, no solo la regla.
 
     Tras escribir, lo que devolvió plan() para esa fecha queda
     desactualizado: vuelve a llamarlo antes del siguiente cambio en el
@@ -278,7 +304,7 @@ async def desagendar(
     if scheduled_workout_ids is not None:
         return await workout_builder.unschedule_workouts_by_id(client, scheduled_workout_ids)
     assert start_date is not None and end_date is not None
-    return await workout_builder.unschedule_workouts_in_range(client, start_date, end_date, exclude_ids or [])
+    return await workout_builder.candidatas_en_rango(client, start_date, end_date, exclude_ids or [])
 
 
 @mcp.tool()
@@ -289,10 +315,18 @@ async def borrar_entreno(workout_ids: list[int] | None = None, source: str | Non
     desagéndalas primero.
 
     Dos modos, uno u otro (no combinar):
-      - Por ids: workout_ids=[...] (los que da plan(), campo workout_id).
-      - Por origen: source="prod_athletedata" (o el valor que sea) — borra
-        todas las plantillas de ese origen (campo "source" de plan()), para
-        limpiar de golpe lo que deja una integración de terceros.
+      - Por ids: workout_ids=[...] — **esto sí borra**, esas plantillas y solo
+        esas. Los workout_id salen de plan() o del modo origen.
+      - Por origen: source="prod_athletedata" (o el valor que sea) — **esto NO
+        borra nada**: devuelve la lista de plantillas con ese origen, con sus
+        nombres, para que se la enseñes al usuario. Si la confirma, vuelve a
+        llamar con esos workout_ids.
+
+    El origen no borra por diseño: "las de Shape" pueden ser 3 o 38 y eso no
+    se ve al aprobar la llamada. Es irreversible, así que lo que se aprueba
+    tiene que ser la lista concreta, no la regla que la genera. Si el usuario
+    pide algo vago ("borra las viejas"), pídele que concrete en vez de
+    decidirlo tú.
 
     Tras escribir, lo que devolvió plan() para esa fecha queda
     desactualizado: vuelve a llamarlo antes del siguiente cambio en el
@@ -304,7 +338,7 @@ async def borrar_entreno(workout_ids: list[int] | None = None, source: str | Non
     if workout_ids is not None:
         return await workout_builder.delete_workouts(client, workout_ids)
     assert source is not None
-    return await workout_builder.delete_workouts_by_source(client, source)
+    return await workout_builder.candidatas_por_origen(client, source)
 
 
 PAGE_STYLE = """

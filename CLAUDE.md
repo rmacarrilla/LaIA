@@ -191,7 +191,10 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
       que distingue un dato malo puntual de un patrón, a coste cero porque
       `get_sleep_daily` ya se pedía) y `sueno_anoche`. Con
       `spo2_detalle=True` añade el mínimo y máximo por noche vía
-      `get_spo2_data`, que es una llamada por día y por eso es opcional.
+      `get_spo2_data`, que es una llamada por día y por eso es opcional —
+      pero se activa solo, avisando en `advertencias`, si alguna noche baja
+      del 92% de media: ahí deja de ser "ha dormido peor" y hace falta el
+      mínimo para ver si se repite.
     - `capacidad()` expone `perfil` (edad, sexo, **peso en kg** —
       `userData.weight` viene en gramos, 67000 → 67, misma trampa de unidades
       que el `speed` del umbral—, altura, VO2max y umbrales).
@@ -205,6 +208,29 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
       mismo dato con nombre distinto según venga de la lista o del detalle, y
       sin ellos una actividad se queda sin deporte (y `sesion()` deja de
       detectar natación y bici).
+  - **Dos pasos para lo que borra en bloque**: `desagendar` y
+    `borrar_entreno` tienen dos modos y solo uno ejecuta. Por **ids** borra o
+    desagenda; por **filtro** (rango de fechas u origen) **no toca nada**:
+    devuelve la lista concreta de lo que coincide, para que el usuario apruebe
+    esa lista y no la regla que la genera ("las de Shape" pueden ser 3 o 38, y
+    eso no se ve en el diálogo de aprobación). El segundo paso se hace pasando
+    los ids que devolvió el primero.
+    No hay un parámetro `confirmar=True` como sugería el spec: la forma misma
+    de la API ya obliga a los dos pasos, y un booleano de confirmación es
+    justo lo que un modelo aprende a poner siempre.
+  - **Otras piezas del spec ya implementadas**: `crear_entreno(agendar_fecha)`
+    crea y agenda en una llamada; `modificar_entreno` parte de la estructura
+    real que devuelve `get_workout_by_id` y aplica encima solo lo que se pase
+    (antes reconstruía desde cero, lo que obligaba a reenviar los pasos para
+    cambiar un nombre y borraba en silencio lo que el esquema no supiera
+    expresar); `capacidad(extras=["dispositivo"])` resume `get_devices` a
+    flags legibles en vez de 250+ campos y, solo si el reloj los declara,
+    pide `get_running_tolerance` y `get_device_solar_data`; `extras=["peso"]`
+    trae `get_body_composition`; `sesion()` añade los kilómetros del material
+    (`get_gear_stats`); y el catálogo de tipos de actividad se cachea a nivel
+    de proceso (no por deportista, que es lo mismo para todos) — no al
+    arrancar, como pedía el spec, porque pedirlo exige una sesión de Garmin
+    autenticada y al arrancar todavía no hay ninguna.
   - **Fallos parciales (`advertencias`)**: cada tool de lectura agrupa varias
     llamadas a Garmin, y que una falle es lo normal, no lo excepcional — basta
     con que el reloj no se haya sincronizado hoy. `_reunir` lanza el grupo con
@@ -213,6 +239,10 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
     relanza la excepción, porque entonces no hay respuesta que dar. Las
     excepciones que no son `Exception` (cancelación, apagado) se relanzan
     siempre: tragárselas rompería el cierre del servidor.
+    Cuando hay advertencias, `estado()` añade además cuándo sincronizó por
+    última vez el reloj (`get_device_last_used`): distinguir "no lo llevó
+    puesto" de "el dato es malo" cambia por completo la lectura de una noche
+    sin HRV.
     Hay un segundo caso, menos obvio y más frecuente: la llamada **funciona
     pero no trae nada**. `get_morning_training_readiness` responde `None` en
     un día sin sincronizar, y `get_training_status` puede devolver el sobre

@@ -34,6 +34,34 @@ _FEEDBACK_PHRASES: dict[str, str] = {}
 _RECORD_TYPE_LABELS: dict[int, str] = {}
 
 
+# El catálogo de tipos de actividad es idéntico para todo el mundo, así que se
+# cachea a nivel de proceso y no por deportista. No se puede cargar al
+# arrancar el servicio, como sería lo ideal: pedirlo exige una sesión de
+# Garmin autenticada y al arrancar todavía no hay ninguna. Se carga en la
+# primera llamada que lo necesite y ya se queda.
+_CATALOGO_ACTIVIDADES: dict[int, str] | None = None
+_CATALOGO_LOCK = asyncio.Lock()
+
+
+async def catalogo_de_actividades(client: Garmin) -> dict[int, str]:
+    """typeId -> typeKey de Garmin. Un fallo aquí no debe tumbar una lectura:
+    sin catálogo se devuelve vacío y quien lo use se queda con el typeKey que
+    ya viene en cada actividad."""
+    global _CATALOGO_ACTIVIDADES
+    if _CATALOGO_ACTIVIDADES is not None:
+        return _CATALOGO_ACTIVIDADES
+    async with _CATALOGO_LOCK:
+        if _CATALOGO_ACTIVIDADES is None:
+            try:
+                tipos = await asyncio.to_thread(client.get_activity_types)
+                _CATALOGO_ACTIVIDADES = {
+                    t["typeId"]: t["typeKey"] for t in tipos if t.get("typeId") and t.get("typeKey")
+                }
+            except Exception:
+                _CATALOGO_ACTIVIDADES = {}
+    return _CATALOGO_ACTIVIDADES
+
+
 def _field(activity: dict[str, Any], name: str) -> Any:
     """Las dos formas en que llega una actividad no ponen los mismos campos en
     el mismo sitio, comprobado contra la cuenta real: get_activity (detalle)
@@ -386,7 +414,8 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
 
     spo2_detalle=True añade a cada noche el SpO2 mínimo y máximo, que exige
     una llamada por día — pídelo solo cuando estés investigando una bajada
-    concreta, no por rutina."""
+    concreta. No hace falta pedirlo por rutina: si alguna noche baja del 92%
+    de media, se añade solo y se avisa en `advertencias`."""
     if not 1 <= dias <= 31:
         raise ValueError("dias debe estar entre 1 y 31")
 
@@ -406,6 +435,19 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
     out, advertencias = await _reunir(calls)
 
     noches = _noches(out["sleep_daily"])
+    # El detalle de SpO2 se pide solo cuando hace falta: o porque lo piden
+    # explícitamente, o porque alguna noche baja del umbral y entonces
+    # importa distinguir una caída puntual de un patrón, que es justo lo que
+    # el mínimo por noche responde y la media no.
+    bajas = [n["fecha"] for n in noches if (n.get("spo2_medio") or 100) < _SPO2_UMBRAL]
+    if bajas and not spo2_detalle:
+        spo2_detalle = True
+        advertencias.append(
+            {
+                "dato": "spo2_detalle",
+                "motivo": f"pedido automáticamente: {len(bajas)} noche(s) con SpO2 medio por debajo de {_SPO2_UMBRAL}%",
+            }
+        )
     if spo2_detalle:
         detalles = await asyncio.gather(
             *(asyncio.to_thread(client.get_spo2_data, n["fecha"]) for n in noches),
@@ -433,6 +475,22 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
             {"dato": "entrenamiento.fase", "motivo": "Garmin devolvió el estado de entrenamiento sin datos de dispositivo"}
         )
 
+    # Si falta algo de hoy, la causa más probable es que el reloj no haya
+    # sincronizado — y eso se puede comprobar en vez de suponerlo. Distinguir
+    # "no llevó el reloj / no ha sincronizado" de "el dato es malo" cambia por
+    # completo la lectura de una noche sin HRV.
+    if advertencias:
+        try:
+            ultimo_uso = await asyncio.to_thread(client.get_device_last_used)
+            if ultimo_uso:
+                out_ultimo = {
+                    "dispositivo": ultimo_uso.get("lastUsedDeviceName"),
+                    "ultima_sincronizacion": ultimo_uso.get("lastUsedDeviceUploadTime"),
+                }
+                advertencias.append({"dato": "ultima_sincronizacion", "motivo": str(out_ultimo)})
+        except Exception:
+            pass  # el diagnóstico es un extra: si falla, no pasa nada
+
     return {
         "range": {"start": start_str, "end": end_str},
         "advertencias": advertencias,
@@ -452,7 +510,49 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
     }
 
 
-_CAPACIDAD_EXTRAS = {"ftp_progresion", "records", "hill_score", "edad_forma", "dispositivo"}
+# De los 250+ campos de get_devices solo interesan los que dicen si tiene
+# sentido pedir un dato que depende del hardware: preguntar por tolerancia de
+# carrera a un reloj que no la calcula devuelve vacío y confunde. Se derivan
+# unos pocos flags legibles en vez de devolver el volcado entero.
+_CAPACIDADES_DISPOSITIVO = {
+    "runningToleranceCapable": "tolerancia_de_carrera",
+    "solarPanelUtilizationCapable": "datos_solares",
+    "hrvStatusCapable": "hrv",
+    "bodyBatteryCapable": "body_battery",
+    "sleepScoreCapable": "puntuacion_de_sueno",
+    "pulseOxSleepCapable": "spo2_nocturno",
+    "trainingReadinessCapable": "training_readiness",
+    "trainingStatusCapable": "estado_de_entrenamiento",
+    "lactateThresholdCapable": "umbral_de_lactato",
+    "cyclingPowerZonesCapable": "zonas_de_potencia_bici",
+    "runningPowerZonesCapable": "zonas_de_potencia_carrera",
+}
+
+
+def _resumen_dispositivos(devices: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Nombre del reloj y qué sabe hacer, en vez de sus 250+ campos crudos."""
+    resumen = []
+    for d in devices or []:
+        capacidades = {nombre: bool(d.get(clave)) for clave, nombre in _CAPACIDADES_DISPOSITIVO.items()}
+        resumen.append(
+            {
+                "nombre": d.get("productDisplayName") or d.get("displayName"),
+                "device_id": d.get("deviceId"),
+                "principal": bool(d.get("primaryTrainingDevice") or d.get("primary")),
+                "firmware": d.get("currentFirmwareVersion"),
+                "capacidades": capacidades,
+            }
+        )
+    return resumen
+
+
+# Por debajo de esto, una noche deja de ser "ha dormido peor" y merece mirar
+# el mínimo: una desaturación puntual puede ser irrelevante, pero repetida
+# apunta a algo que revisar, y eso solo se ve con la serie de mínimos.
+_SPO2_UMBRAL = 92
+
+
+_CAPACIDAD_EXTRAS = {"ftp_progresion", "records", "hill_score", "edad_forma", "dispositivo", "peso", "material"}
 
 
 async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str, Any]:
@@ -469,9 +569,10 @@ async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str
     cycling — útil en revisión de bloque), "records" (récords personales),
     "hill_score" (capacidad en terreno con subidas — solo si hay desnivel
     relevante en la pregunta), "edad_forma" (edad de forma física, solo si se
-    pregunta por ella), "dispositivo" (capacidades del reloj — más de 250
-    campos; se pide una vez al conectar la cuenta, no en cada conversación,
-    para saber qué endpoints tienen sentido para ese dispositivo concreto)."""
+    pregunta por ella), "peso" (evolución del peso en 90 días, para potencia
+    relativa o impacto por zancada), "dispositivo" (qué sabe hacer el reloj,
+    resumido en flags; con él se piden además, y solo si el reloj los
+    soporta, tolerancia de carrera y datos solares)."""
     extras = extras or []
     unknown = set(extras) - _CAPACIDAD_EXTRAS
     if unknown:
@@ -507,6 +608,12 @@ async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str
         base_calls["fitness_age"] = asyncio.to_thread(client.get_fitnessage_data, today)
     if "dispositivo" in extras:
         base_calls["devices"] = asyncio.to_thread(client.get_devices)
+    if "peso" in extras:
+        # Peso a lo largo del tiempo: relevante para potencia relativa y para
+        # el impacto por zancada, no para el día a día.
+        base_calls["body_composition"] = asyncio.to_thread(
+            client.get_body_composition, (date.today() - timedelta(days=90)).isoformat(), today
+        )
 
     out, advertencias = await _reunir(base_calls)
     out["advertencias"] = advertencias
@@ -564,6 +671,24 @@ async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str
             )
             if predicciones.get(clave)
         }
+
+    if "dispositivo" in extras:
+        out["devices"] = _resumen_dispositivos(out.get("devices"))
+        # Lo que depende del hardware se pide solo si el reloj dice que lo
+        # tiene, nunca a ciegas: ese era el sentido de mirar get_devices.
+        capaz = {
+            nombre: any(d["capacidades"].get(nombre) for d in out["devices"])
+            for nombre in ("tolerancia_de_carrera", "datos_solares")
+        }
+        condicionales: dict[str, Any] = {}
+        if capaz["tolerancia_de_carrera"]:
+            condicionales["running_tolerance"] = asyncio.to_thread(client.get_running_tolerance)
+        if capaz["datos_solares"]:
+            condicionales["device_solar"] = asyncio.to_thread(client.get_device_solar_data, today)
+        if condicionales:
+            extra_datos, extra_avisos = await _reunir(condicionales)
+            out.update(extra_datos)
+            advertencias.extend(extra_avisos)
 
     if "records" in extras and isinstance(out.get("personal_records"), list):
         out["personal_records"] = [
@@ -635,7 +760,10 @@ async def sesion(
     pídelo solo cuando la pregunta sea de deriva cardiaca o desacople, nunca
     por defecto. potencia_por_zona=True trae el reparto de potencia por zona
     — solo tiene sentido en bici (se ignora en cualquier otro deporte) y solo
-    si se pregunta específicamente por ese reparto."""
+    si se pregunta específicamente por ese reparto.
+
+    Incluye el material usado y sus kilómetros acumulados (`gear_stats`),
+    para poder cruzar una molestia con unas zapatillas gastadas."""
     activity = await asyncio.to_thread(client.get_activity, str(activity_id))
     sport = ((activity.get("activityTypeDTO") or {}).get("typeKey") or "").lower()
 
@@ -654,6 +782,18 @@ async def sesion(
     # sale el deporte del que dependen las demás llamadas, y sin él no hay
     # sesión que detallar. Lo de aquí abajo sí es complementario.
     extra, advertencias = await _reunir(calls)
+
+    # Kilómetros acumulados del material usado, que es lo que permite cruzar
+    # una molestia con unas zapatillas gastadas. El uuid solo se conoce
+    # después de saber qué material se usó, así que va en un segundo paso.
+    gear = extra.get("gear")
+    uuids = [g.get("uuid") for g in (gear or []) if isinstance(g, dict) and g.get("uuid")]
+    if uuids:
+        stats, avisos_gear = await _reunir(
+            {f"gear_stats_{uuid}": asyncio.to_thread(client.get_gear_stats, uuid) for uuid in uuids}
+        )
+        extra["gear_stats"] = list(stats.values())
+        advertencias.extend(avisos_gear)
 
     return {"activity": _enrich_activity(activity), "advertencias": advertencias, **extra}
 

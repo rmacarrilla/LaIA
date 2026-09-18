@@ -247,26 +247,102 @@ def build_workout(sport: str, name: str, steps: list[dict[str, Any]]) -> BaseWor
     )
 
 
-def upload_workout(client: Garmin, sport: str, name: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+def upload_workout(
+    client: Garmin,
+    sport: str,
+    name: str,
+    steps: list[dict[str, Any]],
+    agendar_fecha: str | None = None,
+) -> dict[str, Any]:
     """Construye y sube el workout a la cuenta de Garmin del usuario — usado
-    por la tool crear_entreno. Llamada bloqueante — envolver con
+    por la tool crear_entreno. Con `agendar_fecha` lo deja además puesto en
+    esa fecha del calendario, que es lo que se quiere casi siempre al crear
+    un entreno para un día concreto, y ahorra tener que encadenar agendar()
+    con un workout_id recién salido. Llamada bloqueante — envolver con
     asyncio.to_thread desde la tool."""
     workout = build_workout(sport, name, steps)
     upload = getattr(client, _UPLOAD_METHODS[sport])
     result = upload(workout)
-    return {"workout_id": result.get("workoutId"), "name": result.get("workoutName", name)}
+    workout_id = result.get("workoutId")
+
+    salida = {"workout_id": workout_id, "name": result.get("workoutName", name)}
+    if agendar_fecha and workout_id:
+        agenda = client.schedule_workout(workout_id, agendar_fecha)
+        # schedule_workout llama al id workoutScheduleId; en el calendario es
+        # "id". Se normaliza aquí al mismo nombre que usa plan().
+        salida["scheduled_workout_id"] = agenda.get("workoutScheduleId")
+        salida["fecha"] = agendar_fecha
+    return salida
 
 
-def update_workout(client: Garmin, workout_id: int, sport: str, name: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
-    """Reconstruye la plantilla (mismo esquema genérico de pasos que
-    build_workout, usado por crear_entreno) y la manda con update_workout —
-    usado por la tool modificar_entreno. Garmin reemplaza la plantilla
-    entera vía PUT y fuerza el workoutId del cuerpo a coincidir con el de la
-    URL, así que lo ya agendado no se rompe. Llamada bloqueante — envolver
-    con asyncio.to_thread desde la tool."""
-    workout = build_workout(sport, name, steps)
-    result = client.update_workout(workout_id, workout.to_dict())
-    return {"workout_id": workout_id, "result": result}
+def update_workout(
+    client: Garmin,
+    workout_id: int,
+    sport: str | None = None,
+    name: str | None = None,
+    steps: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Modifica una plantilla ya existente conservando su workout_id — lo ya
+    agendado con ella no se rompe, porque Garmin reemplaza la plantilla vía
+    PUT y fuerza el workoutId del cuerpo a coincidir con el de la URL.
+
+    Parte SIEMPRE de la estructura real que devuelve get_workout_by_id y le
+    aplica encima solo lo que se pida. Antes se reconstruía la plantilla
+    entera desde cero a partir de (deporte, nombre, pasos), lo que obligaba a
+    reenviar todo aunque solo cambiara el nombre y, peor, borraba en silencio
+    cualquier cosa de la plantilla que el esquema de pasos no sepa expresar.
+    Cambiar solo el nombre es ahora `update_workout(client, id, name="...")`.
+
+    Llamada bloqueante — envolver con asyncio.to_thread desde la tool."""
+    actual = client.get_workout_by_id(workout_id)
+
+    if steps is not None:
+        # Cambiar los pasos sí exige reconstruir el cuerpo del entreno: se
+        # respeta el deporte que ya tenía si no se pide otro.
+        deporte = sport or _deporte_de(actual)
+        nuevo = build_workout(deporte, name or actual.get("workoutName", ""), steps).to_dict()
+        actual["workoutSegments"] = nuevo["workoutSegments"]
+        actual["sportType"] = nuevo["sportType"]
+        actual["estimatedDurationInSecs"] = nuevo["estimatedDurationInSecs"]
+    elif sport is not None:
+        actual["sportType"] = _SPORT_TYPES[sport]
+
+    if name is not None:
+        actual["workoutName"] = name
+
+    result = client.update_workout(workout_id, actual)
+    return {"workout_id": workout_id, "name": actual.get("workoutName"), "result": result}
+
+
+def _deporte_de(workout: dict[str, Any]) -> str:
+    """El nombre corto de deporte que usa este módulo, a partir de la
+    plantilla tal como la devuelve Garmin."""
+    clave = (workout.get("sportType") or {}).get("sportTypeKey")
+    for nombre, tipo in _SPORT_TYPES.items():
+        if tipo["sportTypeKey"] == clave:
+            return nombre
+    raise ValueError(f"La plantilla {workout.get('workoutId')} es de un deporte no soportado: {clave!r}")
+
+
+async def candidatas_en_rango(
+    client: Garmin, start_date: str, end_date: str, exclude_ids: list[int]
+) -> dict[str, Any]:
+    """Enseña qué hay agendado en el rango, SIN desagendar nada. Mismo motivo
+    que candidatas_por_origen: se aprueba una lista concreta, no un rango de
+    fechas cuyo contenido no se ve."""
+    exclude = set(exclude_ids)
+    candidatas = await training_data.find_scheduled_in_range(client, start_date, end_date)
+    afectadas = [c for c in candidatas if c["scheduled_workout_id"] not in exclude]
+    return {
+        "range": {"start": start_date, "end": end_date},
+        "coinciden": len(afectadas),
+        "agendados": afectadas,
+        "excluidos": sorted(exclude & {c["scheduled_workout_id"] for c in candidatas}),
+        "siguiente_paso": (
+            "Enseña esta lista al usuario y, si la confirma, llama otra vez con "
+            "scheduled_workout_ids=[...] usando exactamente estos ids. Nada se ha desagendado todavía."
+        ),
+    }
 
 
 async def unschedule_workouts_in_range(
@@ -327,14 +403,20 @@ async def delete_workouts(client: Garmin, workout_ids: list[int]) -> dict[str, A
     return {"deleted_count": len(deleted), "deleted_ids": deleted, "failed_ids": failed}
 
 
-async def delete_workouts_by_source(client: Garmin, source: str) -> dict[str, Any]:
-    """Borra de verdad todas las plantillas cuyo origen (training_data.
-    list_workout_templates, campo "source" = consumerName de Garmin, p.ej.
-    "prod_athletedata" o "Shape") coincide exactamente con `source`. Modo
-    "source" de la tool borrar_entreno — para limpiar de golpe las plantillas
-    que deja una integración de terceros sin tener que conocer cada
-    workout_id."""
+async def candidatas_por_origen(client: Garmin, source: str) -> dict[str, Any]:
+    """Enseña qué plantillas tienen ese origen, SIN borrar nada. Primer paso
+    obligatorio del borrado en bloque: quien aprueba la acción tiene que ver
+    la lista concreta de lo que va a desaparecer, no una regla ("las de
+    Shape") cuyo alcance —3 plantillas o 38— no está a la vista en el momento
+    de decir que sí. El segundo paso borra pasando esos workout_id."""
     templates = await training_data.list_workout_templates(client)
-    matching_ids = [t["workout_id"] for t in templates if t["source"] == source]
-    result = await delete_workouts(client, matching_ids)
-    return {**result, "source": source}
+    coinciden = [t for t in templates if t["source"] == source]
+    return {
+        "source": source,
+        "coinciden": len(coinciden),
+        "plantillas": coinciden,
+        "siguiente_paso": (
+            "Enseña esta lista al usuario y, si la confirma, llama otra vez con "
+            "workout_ids=[...] usando exactamente estos workout_id. Nada se ha borrado todavía."
+        ),
+    }
