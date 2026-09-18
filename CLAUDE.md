@@ -205,6 +205,20 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
       mismo dato con nombre distinto según venga de la lista o del detalle, y
       sin ellos una actividad se queda sin deporte (y `sesion()` deja de
       detectar natación y bici).
+  - **Fallos parciales (`advertencias`)**: cada tool de lectura agrupa varias
+    llamadas a Garmin, y que una falle es lo normal, no lo excepcional — basta
+    con que el reloj no se haya sincronizado hoy. `_reunir` lanza el grupo con
+    `return_exceptions=True` y devuelve lo que sí llegó más una lista
+    `advertencias` con qué faltó y por qué; solo si fallan **todas** se
+    relanza la excepción, porque entonces no hay respuesta que dar. Las
+    excepciones que no son `Exception` (cancelación, apagado) se relanzan
+    siempre: tragárselas rompería el cierre del servidor.
+    Hay un segundo caso, menos obvio y más frecuente: la llamada **funciona
+    pero no trae nada**. `get_morning_training_readiness` responde `None` en
+    un día sin sincronizar, y `get_training_status` puede devolver el sobre
+    entero con `latestTrainingStatusData` a `None`. Sin avisar, quien lea la
+    respuesta ve un `null` con `advertencias: []` y no sabe si es un fallo o
+    es que aún no hay dato — así que ambos casos generan también advertencia.
   - **Trampas de unidades y escalas, todas verificadas contra la cuenta real**
     (auditoría acotada a unidades, a raíz de que dos de los tres bugs de la
     fase anterior fueran de este tipo). Importan porque no fallan: devuelven

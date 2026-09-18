@@ -204,11 +204,58 @@ def _translate_feedback_phrases(obj: Any) -> Any:
     return obj
 
 
-def _entrenamiento(training_status: dict[str, Any]) -> dict[str, Any]:
+async def _reunir(llamadas: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Lanza en paralelo las llamadas de `llamadas` y devuelve lo que sí se
+    obtuvo más una lista de advertencias por cada una que falló.
+
+    Cada tool de lectura agrupa varias llamadas a Garmin, y que una falle es
+    lo normal, no lo excepcional: basta con que el deportista no llevara el
+    reloj esa noche, o que no haya sincronizado hoy todavía. Sin esto, un
+    único fallo tumbaba la tool entera y la conversación se quedaba sin los
+    otros seis datos que sí estaban.
+
+    Si fallan TODAS se relanza la primera excepción: eso ya no es un fallo
+    parcial, es que no hay nada que devolver, y disfrazarlo de respuesta
+    vacía sería peor que fallar. Las excepciones que no son `Exception`
+    (cancelación, cierre del proceso) se relanzan siempre: no son fallos de
+    datos y tragárselas rompería el apagado del servidor."""
+    nombres = list(llamadas)
+    resultados = await asyncio.gather(*llamadas.values(), return_exceptions=True)
+
+    datos: dict[str, Any] = {}
+    advertencias: list[dict[str, str]] = []
+    fallos = 0
+    for nombre, resultado in zip(nombres, resultados):
+        if isinstance(resultado, BaseException) and not isinstance(resultado, Exception):
+            raise resultado
+        if isinstance(resultado, Exception):
+            fallos += 1
+            datos[nombre] = None
+            advertencias.append({"dato": nombre, "motivo": f"{type(resultado).__name__}: {resultado}"})
+            continue
+        datos[nombre] = resultado
+        # Garmin distingue mal "falló la llamada" de "todavía no hay dato": a
+        # get_morning_training_readiness de un día sin sincronizar responde
+        # None, sin error. Sin avisar aquí, quien lea la respuesta ve un null
+        # con advertencias vacías y no sabe si es un fallo o es que el reloj
+        # aún no ha volcado los datos de hoy.
+        if resultado is None:
+            advertencias.append(
+                {"dato": nombre, "motivo": "sin datos todavía (lo más habitual: el reloj no ha sincronizado aún)"}
+            )
+
+    if nombres and fallos == len(nombres):
+        primera = next(r for r in resultados if isinstance(r, Exception))
+        raise primera
+    return datos, advertencias
+
+
+def _entrenamiento(training_status: dict[str, Any] | None) -> dict[str, Any]:
     """Aplana get_training_status: fase de entrenamiento, reparto de carga
     mensual frente a objetivo y VO2max. Los dos primeros cuelgan de una clave
     que es el id del reloj (ver _del_dispositivo_principal), así que sin esto
     el dato está pero nadie lo encuentra."""
+    training_status = training_status or {}
     estado_dev = _del_dispositivo_principal(
         (training_status.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData")
     )
@@ -275,13 +322,13 @@ _CAMPOS_NOCHE = {
 }
 
 
-def _noches(sleep_daily: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _noches(sleep_daily: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Una fila por noche con los campos de _CAMPOS_NOCHE sacados de "values".
     Es la serie que permite distinguir un dato malo puntual de un patrón
     (SpO2, HRV, FC en reposo, temperatura de piel), y no cuesta ninguna
     llamada extra: get_sleep_daily ya se pide para el rango de estado()."""
     noches = []
-    for fila in sleep_daily:
+    for fila in sleep_daily or []:
         valores = fila.get("values") or {}
         noche = {"fecha": fila.get("calendarDate")}
         noche.update({destino: valores.get(origen) for origen, destino in _CAMPOS_NOCHE.items()})
@@ -307,10 +354,11 @@ _SLEEP_SERIES = frozenset(
 )
 
 
-def _sueno_anoche(sleep_data: dict[str, Any]) -> dict[str, Any]:
+def _sueno_anoche(sleep_data: dict[str, Any] | None) -> dict[str, Any]:
     """Resumen de la última noche: los escalares de dailySleepDTO (fases,
     SpO2 medio/mínimo/máximo, respiración) más HRV y FC en reposo. Fuera todas
     las series por época — eran 181 KB de los 241 KB que pesaba estado()."""
+    sleep_data = sleep_data or {}
     diario = _sin_claves(sleep_data.get("dailySleepDTO") or {}, _SLEEP_SERIES)
     return {
         **diario,
@@ -355,9 +403,7 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
         "training_status": asyncio.to_thread(client.get_training_status, today_str),
         "activities": asyncio.to_thread(client.get_activities_by_date, start_str, end_str),
     }
-    keys = list(calls)
-    results = await asyncio.gather(*calls.values())
-    out = dict(zip(keys, results))
+    out, advertencias = await _reunir(calls)
 
     noches = _noches(out["sleep_daily"])
     if spo2_detalle:
@@ -365,14 +411,32 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
             *(asyncio.to_thread(client.get_spo2_data, n["fecha"]) for n in noches),
             return_exceptions=True,
         )
+        fallidas = 0
         for noche, detalle in zip(noches, detalles):
-            if not isinstance(detalle, BaseException) and detalle:
+            if isinstance(detalle, BaseException) and not isinstance(detalle, Exception):
+                raise detalle  # cancelación/apagado: no es un fallo de datos
+            if isinstance(detalle, Exception):
+                fallidas += 1
+            elif detalle:
                 noche["spo2_minimo"] = detalle.get("lowestSpO2")
                 noche["spo2_medio_dia"] = detalle.get("averageSpO2")
+        if fallidas:
+            advertencias.append(
+                {"dato": "spo2_detalle", "motivo": f"{fallidas} de {len(noches)} noches sin detalle de SpO2"}
+            )
+
+    entrenamiento = _entrenamiento(_translate_feedback_phrases(out["training_status"]))
+    # get_training_status puede responder el sobre entero con
+    # latestTrainingStatusData a None: la llamada no falla, pero no hay fase.
+    if out["training_status"] is not None and entrenamiento["fase"] is None:
+        advertencias.append(
+            {"dato": "entrenamiento.fase", "motivo": "Garmin devolvió el estado de entrenamiento sin datos de dispositivo"}
+        )
 
     return {
         "range": {"start": start_str, "end": end_str},
-        "entrenamiento": _entrenamiento(_translate_feedback_phrases(out["training_status"])),
+        "advertencias": advertencias,
+        "entrenamiento": entrenamiento,
         "training_readiness": _translate_feedback_phrases(out["training_readiness"]),
         "noches": noches,
         "sueno_anoche": _sueno_anoche(out["sleep_last_night"]),
@@ -381,10 +445,10 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
         # siguen estando en stats_today.
         "body_battery": [
             {"fecha": d.get("date"), "cargado": d.get("charged"), "gastado": d.get("drained")}
-            for d in out["body_battery"]
+            for d in out["body_battery"] or []
         ],
-        "stats_today": _sin_claves(out["stats_today"], {"bodyBatteryActivityEventList"}),
-        "activities": [_enrich_activity(a) for a in out["activities"]],
+        "stats_today": _sin_claves(out["stats_today"] or {}, {"bodyBatteryActivityEventList"}),
+        "activities": [_enrich_activity(a) for a in out["activities"] or []],
     }
 
 
@@ -444,9 +508,8 @@ async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str
     if "dispositivo" in extras:
         base_calls["devices"] = asyncio.to_thread(client.get_devices)
 
-    keys = list(base_calls)
-    results = await asyncio.gather(*base_calls.values(), return_exceptions=True)
-    out: dict[str, Any] = {key: (None if isinstance(value, Exception) else value) for key, value in zip(keys, results)}
+    out, advertencias = await _reunir(base_calls)
+    out["advertencias"] = advertencias
 
     # birthDate cuelga de userData, no del nivel de arriba del perfil.
     user_profile = out.get("user_profile")
@@ -519,10 +582,14 @@ async def carga(client: Garmin, inicio: str, fin: str) -> dict[str, Any]:
     volumen que se ha hecho)."""
     _validate_range(inicio, fin)
 
-    activities, weekly_stress = await asyncio.gather(
-        asyncio.to_thread(client.get_activities_by_date, inicio, fin),
-        asyncio.to_thread(client.get_weekly_stress, fin),
+    base, advertencias = await _reunir(
+        {
+            "activities": asyncio.to_thread(client.get_activities_by_date, inicio, fin),
+            "weekly_stress": asyncio.to_thread(client.get_weekly_stress, fin),
+        }
     )
+    activities = base["activities"] or []
+    weekly_stress = base["weekly_stress"]
 
     # get_activity por sesión para el RPE/feel, que no vienen en la lista —
     # pero fusionando, no reemplazando: la lista es la única que trae
@@ -533,12 +600,25 @@ async def carga(client: Garmin, inicio: str, fin: str) -> dict[str, Any]:
         return_exceptions=True,
     )
     enriched = []
+    sin_detalle = 0
     for activity, detail in zip(activities, details):
-        merged = activity if isinstance(detail, BaseException) else {**activity, **detail}
+        if isinstance(detail, BaseException):
+            sin_detalle += 1
+            merged = activity
+        else:
+            merged = {**activity, **detail}
         enriched.append(_enrich_activity(merged))
+    if sin_detalle:
+        advertencias.append(
+            {
+                "dato": "detalle_de_actividad",
+                "motivo": f"{sin_detalle} de {len(activities)} sesiones sin detalle: van sin RPE ni feel",
+            }
+        )
 
     return {
         "range": {"start": inicio, "end": fin},
+        "advertencias": advertencias,
         "activities": enriched,
         "weekly_stress": weekly_stress,
     }
@@ -570,11 +650,12 @@ async def sesion(
     if potencia_por_zona and ("cycling" in sport or "biking" in sport):
         calls["power_in_timezones"] = asyncio.to_thread(client.get_activity_power_in_timezones, str(activity_id))
 
-    keys = list(calls)
-    results = await asyncio.gather(*calls.values())
-    extra = dict(zip(keys, results))
+    # get_activity ya se pidió arriba sin tolerancia a fallo, a propósito: de él
+    # sale el deporte del que dependen las demás llamadas, y sin él no hay
+    # sesión que detallar. Lo de aquí abajo sí es complementario.
+    extra, advertencias = await _reunir(calls)
 
-    return {"activity": _enrich_activity(activity), **extra}
+    return {"activity": _enrich_activity(activity), "advertencias": advertencias, **extra}
 
 
 def _months_between(start: date, end: date) -> list[tuple[int, int]]:
@@ -606,19 +687,21 @@ async def plan(client: Garmin, inicio: str, fin: str, workout_id: int | None = N
 
     workout_id (opcional): además, la estructura completa de esa plantilla
     concreta — pásalo cuando vayas a leerla, clonarla o modificarla."""
-    scheduled, templates = await asyncio.gather(
-        find_scheduled_in_range(client, inicio, fin),
-        list_workout_templates(client),
-    )
-    workout_detail = (
-        await asyncio.to_thread(client.get_workout_by_id, workout_id) if workout_id is not None else None
-    )
+    llamadas: dict[str, Any] = {
+        "scheduled": find_scheduled_in_range(client, inicio, fin),
+        "templates": list_workout_templates(client),
+    }
+    if workout_id is not None:
+        llamadas["workout_detail"] = asyncio.to_thread(client.get_workout_by_id, workout_id)
+
+    out, advertencias = await _reunir(llamadas)
 
     return {
         "range": {"start": inicio, "end": fin},
-        "scheduled": scheduled,
-        "templates": templates,
-        "workout_detail": workout_detail,
+        "advertencias": advertencias,
+        "scheduled": out["scheduled"] or [],
+        "templates": out["templates"] or [],
+        "workout_detail": out.get("workout_detail"),
     }
 
 
