@@ -25,6 +25,12 @@ import db
 import garmin_client
 
 ACCESS_TOKEN_TTL_SECONDS = 3600
+# Los refresh no caducaban: un token filtrado servía para siempre y su fila
+# —que lleva dentro el id de usuario— se quedaba en la tabla indefinidamente,
+# sin política de retención. Con caducidad, purge_expired_objects los recoge
+# solo, igual que al resto. 30 días es largo para que nadie tenga que volver
+# a autorizar por rutina, y corto para que un token perdido no sea eterno.
+REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 3600
 AUTH_CODE_TTL_SECONDS = 600  # tiempo para rellenar el formulario de login
 LOGIN_FLOW_TTL_SECONDS = 600
 
@@ -133,7 +139,14 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        await db.delete_object("refresh", refresh_token.token)  # se rota en cada uso
+        # Mismo canje atómico que el authorization code, por el mismo motivo:
+        # entre el load_refresh_token() del SDK y este borrado, otra petición
+        # con el mismo token podría colarse y llevarse un segundo par de
+        # tokens válido. Que delete_object confirme que de verdad borró la
+        # fila hace que solo gane uno.
+        rotated = await db.delete_object("refresh", refresh_token.token)
+        if not rotated:
+            raise TokenError(error="invalid_grant", error_description="refresh token already used")
         return await self._issue_tokens(client.client_id, scopes or refresh_token.scopes, refresh_token.subject)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
@@ -166,7 +179,7 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         )
         refresh = RefreshToken(token=secrets.token_urlsafe(32), client_id=client_id, scopes=scopes, subject=subject)
         await db.save_object("access", access.token, access, _expires_at_dt(ACCESS_TOKEN_TTL_SECONDS))
-        await db.save_object("refresh", refresh.token, refresh)  # sin expiración hasta que se rote o se revoque
+        await db.save_object("refresh", refresh.token, refresh, _expires_at_dt(REFRESH_TOKEN_TTL_SECONDS))
 
         return OAuthToken(
             access_token=access.token,
