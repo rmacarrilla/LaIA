@@ -205,6 +205,36 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
       mismo dato con nombre distinto según venga de la lista o del detalle, y
       sin ellos una actividad se queda sin deporte (y `sesion()` deja de
       detectar natación y bici).
+  - **Trampas de unidades y escalas, todas verificadas contra la cuenta real**
+    (auditoría acotada a unidades, a raíz de que dos de los tres bugs de la
+    fase anterior fueran de este tipo). Importan porque no fallan: devuelven
+    un número plausible pero equivocado, y un modelo usándolo no tiene forma
+    de detectarlo — a diferencia de un dato que falta, que sí reporta.
+    - `directWorkoutRpe` viene **×10** (30 = RPE 3, escala 0-10 del reloj).
+    - `userData.weight` viene en **gramos** (67000 = 67 kg).
+    - `speed` de `get_lactate_threshold` y `lactateThresholdSpeed` vienen en
+      **m/s ÷ 10** (0.369 = 3,69 m/s ≈ 4:31 min/km, no 45 min/km). Misma
+      codificación que usa Garmin en los targets de ritmo de un entreno
+      (0.274 ↔ 6:05/km), que es con lo que se confirmó.
+    - `averageSpeed` se calcula sobre **`movingDuration`**, no sobre
+      `duration`. En carrera y bici coinciden; en natación no, porque los
+      descansos entre series no cuentan como movimiento: 1300 m en 2234 s de
+      reloj con 1225 s nadando son 2:51/100m o 1:34/100m según cuál uses.
+      Por eso `_ritmos` devuelve los dos con nombre explícito
+      (`seg_por_100m_total` y `seg_por_100m_en_movimiento`) en vez de dejar
+      elegir a ciegas.
+    - `sleepNeed` viene en **minutos** (540 = 9h) mientras que los tiempos por
+      fase de la misma respuesta (`deepTime`, `lightTime`...) vienen en
+      **segundos** — de ahí el sufijo en `sueno_necesario_min`.
+    - `sueno_total_s` **excluye** el tiempo despierto: deep + light + rem
+      cuadra exacto con el total, sumarle `despierto_s` no.
+    - `race_predictions` son **segundos** pelados (`time5K: 1302`); se añade
+      `race_predictions_ritmo` con el min/km que implica cada una.
+    - `beginTimestamp` es epoch en **milisegundos**.
+    Comprobadas y correctas, sin necesidad de conversión: distancias en
+    metros, duraciones y `hrTimeInZone_*` en segundos (la suma de zonas nunca
+    supera la duración), zonas de FC en bpm y de potencia en vatios,
+    `weekly_stress` y body battery en 0-100, training effect en 0-5.
   - **Las descripciones de las tools son el protocolo de encadenado**: la
     sección 5 del spec ("qué llamar en qué orden para cada tipo de
     conversación") no se implementa como caché ni máquina de estados en el

@@ -118,9 +118,40 @@ def _sin_claves(dic: dict[str, Any], claves: frozenset[str] | set[str]) -> dict[
     return {k: v for k, v in dic.items() if k not in claves}
 
 
+def _ritmos(activity: dict[str, Any]) -> dict[str, Any]:
+    """El ritmo de una sesión son DOS números distintos, y confundirlos es
+    especialmente grave en natación. Comprobado contra la cuenta real:
+    `averageSpeed` de Garmin se calcula sobre `movingDuration` (tiempo en
+    movimiento), no sobre `duration` (tiempo total). En carrera y bici los dos
+    coinciden, pero en una sesión de nado con descansos entre series difieren
+    hasta un 80%: 1300 m en 2234 s de reloj con 1225 s nadando son 2:51/100m
+    contando descansos o 1:34/100m sin contarlos. Se devuelven los dos, con
+    nombre explícito, en vez de dejar que quien lea la respuesta elija sin
+    saber que está eligiendo."""
+    distancia = _field(activity, "distance")
+    duracion = _field(activity, "duration")
+    velocidad = _field(activity, "averageSpeed")
+    if not distancia:
+        return {}
+
+    ritmos: dict[str, Any] = {}
+    if duracion:
+        ritmos["seg_por_km_total"] = duracion / (distancia / 1000)
+        ritmos["seg_por_100m_total"] = duracion / (distancia / 100)
+    if velocidad:
+        ritmos["seg_por_km_en_movimiento"] = 1000 / velocidad
+        ritmos["seg_por_100m_en_movimiento"] = 100 / velocidad
+    return {"ritmo": ritmos} if ritmos else {}
+
+
 def _enrich_activity(activity: dict[str, Any]) -> dict[str, Any]:
     limpia = _sin_claves(activity, _ACTIVITY_NOISE)
-    return {**limpia, **_rpe_feel(activity), "soft_time_seconds": _soft_time_seconds(activity)}
+    return {
+        **limpia,
+        **_rpe_feel(activity),
+        **_ritmos(activity),
+        "soft_time_seconds": _soft_time_seconds(activity),
+    }
 
 
 def _del_dispositivo_principal(mapa: dict[str, Any] | None) -> dict[str, Any]:
@@ -236,7 +267,10 @@ _CAMPOS_NOCHE = {
     "restingHeartRate": "fc_reposo",
     "respiration": "respiracion",
     "skinTempC": "temp_piel_c",
-    "sleepNeed": "sueno_necesario",
+    # OJO: sleepNeed viene en MINUTOS (540 = 9h), a diferencia de los tiempos
+    # por fase de arriba, que vienen en segundos. Misma respuesta, dos
+    # unidades distintas — de ahí el sufijo explícito en el nombre.
+    "sleepNeed": "sueno_necesario_min",
     "bodyBatteryChange": "body_battery_cambio",
 }
 
@@ -448,6 +482,25 @@ async def capacidad(client: Garmin, extras: list[str] | None = None) -> dict[str
         "fc_umbral": user_data.get("lactateThresholdHeartRate"),
         "ritmo_umbral_min_km": out["lactate_threshold_pace_min_per_km"],
     }
+
+    # Las predicciones llegan como segundos pelados ("time5K": 1302), que sin
+    # contexto no dicen nada. Se añade el mismo dato en minutos y el ritmo
+    # medio que implica cada una, que es lo que se usa para prescribir.
+    predicciones = out.get("race_predictions")
+    if isinstance(predicciones, dict):
+        out["race_predictions_ritmo"] = {
+            nombre: {
+                "segundos": predicciones[clave],
+                "min_por_km": predicciones[clave] / km / 60,
+            }
+            for clave, nombre, km in (
+                ("time5K", "5k", 5),
+                ("time10K", "10k", 10),
+                ("timeHalfMarathon", "media_maraton", 21.0975),
+                ("timeMarathon", "maraton", 42.195),
+            )
+            if predicciones.get(clave)
+        }
 
     if "records" in extras and isinstance(out.get("personal_records"), list):
         out["personal_records"] = [
