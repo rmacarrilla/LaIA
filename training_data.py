@@ -144,12 +144,61 @@ def _ritmos(activity: dict[str, Any]) -> dict[str, Any]:
     return {"ritmo": ritmos} if ritmos else {}
 
 
-def _enrich_activity(activity: dict[str, Any]) -> dict[str, Any]:
+def _rtss(activity: dict[str, Any], ftp_carrera: float | None) -> dict[str, Any]:
+    """TSS de carrera, calculado aquí porque Garmin no lo manda.
+
+    Comprobado contra la cuenta real: Garmin emite `trainingStressScore` en
+    el 100% de las actividades de bici y en el 0% de las de carrera, aunque
+    en carrera sí mande potencia media y normalizada. El hueco es suyo, no
+    del conector, así que o se calcula o no hay TSS de carrera.
+
+    Fórmula: (NP / FTP)² × horas × 100, la variante **basada en potencia**.
+    No es la rTSS de TrainingPeaks, que parte del ritmo graduado (NGP), así
+    que los números no son comparables con los de esa herramienta — de ahí
+    el nombre `rtss_estimado` y que se devuelva al lado el FTP usado, para
+    que se pueda auditar de dónde sale en vez de tener que creérselo.
+
+    Solo carrera: en bici ya viene el de Garmin y mezclar los dos sería peor
+    que no tener ninguno."""
+    deporte = ((activity.get("activityTypeDTO") or activity.get("activityType") or {}).get("typeKey") or "").lower()
+    if "running" not in deporte or not ftp_carrera:
+        return {}
+
+    np = _field(activity, "normPower")
+    duracion = _field(activity, "duration")
+    if not np or not duracion:
+        return {}
+
+    return {
+        "rtss_estimado": (np / ftp_carrera) ** 2 * (duracion / 3600) * 100,
+        "rtss_calculado_con": {
+            "ftp_carrera_w": ftp_carrera,
+            "potencia_normalizada_w": np,
+            "formula": "(NP / FTP)^2 * horas * 100",
+            "nota": "Calculado por LaIA: Garmin no manda TSS en carrera. Variante por potencia, no comparable con la rTSS por ritmo de TrainingPeaks.",
+        },
+    }
+
+
+async def _ftp_de_carrera(client: Garmin) -> float | None:
+    """El FTP de carrera vive en el bloque `power` de get_lactate_threshold
+    (sport RUNNING). Un fallo aquí no debe tumbar la lectura: sin FTP
+    simplemente no hay rTSS."""
+    try:
+        umbral = await asyncio.to_thread(client.get_lactate_threshold)
+    except Exception:
+        return None
+    potencia = (umbral or {}).get("power") or {}
+    return potencia.get("functionalThresholdPower") if potencia.get("sport") == "RUNNING" else None
+
+
+def _enrich_activity(activity: dict[str, Any], ftp_carrera: float | None = None) -> dict[str, Any]:
     limpia = _sin_claves(activity, _ACTIVITY_NOISE)
     return {
         **limpia,
         **_rpe_feel(activity),
         **_ritmos(activity),
+        **_rtss(activity, ftp_carrera),
         "soft_time_seconds": _soft_time_seconds(activity),
     }
 
@@ -179,6 +228,57 @@ def _etiqueta_de_frase(frase: str | None) -> str | None:
         return None
     cuerpo = frase.rsplit("_", 1)
     return cuerpo[0] if len(cuerpo) == 2 and cuerpo[1].isdigit() else frase
+
+
+# Lo que Garmin manda como código interno y no se ha podido verificar contra
+# ninguna fuente suya. No se traducen a ciegas: una etiqueta inventada parece
+# una interpretación fundada y no lo es. Se marcan para que quien lea la
+# respuesta sepa que son códigos y no los interprete por su cuenta.
+_CAMPOS_CON_CODIGO = (
+    "trainingEffectLabel",
+    "aerobicTrainingEffectMessage",
+    "anaerobicTrainingEffectMessage",
+    "feedbackLong",
+    "feedbackShort",
+    "trainingStatusFeedbackPhrase",
+    "trainingBalanceFeedbackPhrase",
+    "hrvFactorFeedback",
+    "sleepScoreFactorFeedback",
+    "stressHistoryFactorFeedback",
+    "recoveryTimeFactorFeedback",
+    "acwrFactorFeedback",
+    "sleepScoreQuality",
+)
+
+_AVISO_CODIGOS = (
+    "Estos campos llevan códigos internos de Garmin (MAYÚSCULAS_CON_GUIONES). "
+    "Tradúcelos solo si su significado es evidente; si no lo es, dilo en vez de "
+    "inventarlo — una traducción inventada parece fundada y no lo es."
+)
+
+
+def _codigos_presentes(obj: Any, encontrados: set[str] | None = None) -> set[str]:
+    """Qué campos de código trae de verdad esta respuesta. Se listan los que
+    están, no los que podrían estar, para no avisar de lo que no aparece."""
+    if encontrados is None:
+        encontrados = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _CAMPOS_CON_CODIGO and isinstance(v, str) and v:
+                encontrados.add(k)
+            else:
+                _codigos_presentes(v, encontrados)
+    elif isinstance(obj, list):
+        for v in obj[:20]:
+            _codigos_presentes(v, encontrados)
+    return encontrados
+
+
+def _con_aviso_de_codigos(respuesta: dict[str, Any]) -> dict[str, Any]:
+    codigos = sorted(_codigos_presentes(respuesta))
+    if codigos:
+        respuesta["codigos_sin_traducir"] = {"campos": codigos, "nota": _AVISO_CODIGOS}
+    return respuesta
 
 
 def _translate_feedback_phrases(obj: Any) -> Any:
@@ -463,7 +563,7 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
         except Exception:
             pass  # el diagnóstico es un extra: si falla, no pasa nada
 
-    return {
+    return _con_aviso_de_codigos({
         "range": {"start": start_str, "end": end_str},
         "advertencias": advertencias,
         "entrenamiento": entrenamiento,
@@ -479,7 +579,7 @@ async def estado(client: Garmin, dias: int = 7, spo2_detalle: bool = False) -> d
         ],
         "stats_today": _sin_claves(out["stats_today"] or {}, {"bodyBatteryActivityEventList"}),
         "activities": [_enrich_activity(a) for a in out["activities"] or []],
-    }
+    })
 
 
 # De los 250+ campos de get_devices solo interesan los que dicen si tiene
@@ -683,6 +783,8 @@ async def carga(client: Garmin, inicio: str, fin: str) -> dict[str, Any]:
         {
             "activities": asyncio.to_thread(client.get_activities_by_date, inicio, fin),
             "weekly_stress": asyncio.to_thread(client.get_weekly_stress, fin),
+            # Para el rTSS de carrera, que Garmin no manda y hay que calcular.
+            "ftp_carrera": _ftp_de_carrera(client),
         }
     )
     activities = base["activities"] or []
@@ -704,7 +806,7 @@ async def carga(client: Garmin, inicio: str, fin: str) -> dict[str, Any]:
             merged = activity
         else:
             merged = {**activity, **detail}
-        enriched.append(_enrich_activity(merged))
+        enriched.append(_enrich_activity(merged, base["ftp_carrera"]))
     if sin_detalle:
         advertencias.append(
             {
@@ -713,12 +815,12 @@ async def carga(client: Garmin, inicio: str, fin: str) -> dict[str, Any]:
             }
         )
 
-    return {
+    return _con_aviso_de_codigos({
         "range": {"start": inicio, "end": fin},
         "advertencias": advertencias,
         "activities": enriched,
         "weekly_stress": weekly_stress,
-    }
+    })
 
 
 class ActividadAjenaError(RuntimeError):
@@ -794,7 +896,9 @@ async def sesion(
         extra["gear_stats"] = list(stats.values())
         advertencias.extend(avisos_gear)
 
-    return {"activity": _enrich_activity(activity), "advertencias": advertencias, **extra}
+    return _con_aviso_de_codigos(
+        {"activity": _enrich_activity(activity), "advertencias": advertencias, **extra}
+    )
 
 
 def _months_between(start: date, end: date) -> list[tuple[int, int]]:

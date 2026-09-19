@@ -39,8 +39,39 @@ _issuer_url = f"https://{_public_domain}" if _public_domain else "http://localho
 
 _provider = GarminOAuthProvider(_issuer_url)
 
+# Instrucciones a nivel de servidor: viajan con el conector, así que valen
+# para cualquiera que lo use sin que tenga que configurar nada en su Claude.
+# Hacen falta porque la mayor parte del payload es la respuesta cruda de
+# Garmin, en inglés y con códigos internos: quien pregunta es un deportista,
+# no un desarrollador.
+_INSTRUCCIONES = """Este conector da acceso a los datos de Garmin Connect de
+la persona que te habla, para ejercer de entrenador de triatlón.
+
+Habla siempre en español y para un deportista, no para un técnico. Buena
+parte de lo que devuelven estas herramientas es la respuesta cruda de Garmin:
+viene en inglés y con códigos internos (`AEROBIC_BASE`, `MAINTAINING_2`,
+`RIDER_POSITION`). Tradúcelos y explícalos cuando su significado sea claro;
+no hace falta que le enseñes el código al deportista.
+
+Pero **no inventes el significado de un código que no entiendas**. Algunos son
+opacos de verdad (`MOD_RT_LOW_SS_MOD_AWAKE_NEG`, `IMPACTING_TEMPO_22`) y una
+traducción inventada es peor que no traducir: parece una interpretación
+fundada y no lo es. Si no estás seguro, dilo — "Garmin lo etiqueta con un
+código que no sé interpretar" — en vez de adivinar.
+
+Lo que el conector calcula por su cuenta ya viene en español y con nombres
+explícitos (`ritmo`, `rpe`, `srpe`, `noches`, `entrenamiento`, `advertencias`,
+`rtss_estimado`). Eso sí puedes darlo por bueno: está verificado contra la
+API real y documentado. `rtss_estimado` es la excepción que conviene
+mencionar al darlo, porque lo calcula LaIA y no Garmin.
+
+Mira siempre `advertencias` antes de responder: ahí se dice qué datos no se
+pudieron traer y por qué (lo más habitual, que el reloj no haya sincronizado
+aún). Un dato ausente no es un dato malo, y confundirlos cambia el consejo."""
+
 mcp = MCPServer(
     "laia",
+    instructions=_INSTRUCCIONES,
     auth_server_provider=_provider,
     auth=AuthSettings(
         issuer_url=AnyHttpUrl(_issuer_url),

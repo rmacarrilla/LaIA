@@ -257,6 +257,35 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
     legítimas— pero el aviso sale de la propia tool y no de acordarse de
     llamar a `plan()` antes: una salvaguarda que depende de que el que llama
     se acuerde no es una salvaguarda.
+  - **rTSS de carrera calculado por nosotros**: Garmin emite
+    `trainingStressScore` en el 100% de las actividades de bici y en el 0% de
+    las de carrera, aunque en carrera sí mande potencia normalizada
+    (comprobado contra la cuenta real). El hueco es suyo, no del conector, así
+    que `carga()` lo calcula: `(NP / FTP)² × horas × 100`, con el FTP de
+    carrera que vive en el bloque `power` de `get_lactate_threshold`. Se
+    devuelve como `rtss_estimado` —nombre distinto del campo de Garmin, a
+    propósito— junto a `rtss_calculado_con`, que lleva el FTP, la NP y la
+    fórmula para poder auditarlo en vez de tener que creérselo. Es la variante
+    **por potencia**: no es comparable con la rTSS por ritmo graduado de
+    TrainingPeaks. En bici no se calcula: ya viene el de Garmin y mezclar los
+    dos sería peor que no tener ninguno.
+  - **Códigos de Garmin: marcar, no adivinar**. La mayor parte del payload es
+    respuesta cruda de Garmin, en inglés y con códigos internos
+    (`AEROBIC_BASE`, `MOD_RT_LOW_SS_MOD_AWAKE_NEG`). El riesgo real no es que
+    el deportista vea inglés —quien lee esto es el modelo, que traduce al
+    hablar— sino que el modelo **invente** el significado de un código opaco:
+    una traducción inventada parece fundada y no lo es. Así que no se
+    traducen a ciegas: `_con_aviso_de_codigos` añade
+    `codigos_sin_traducir` listando **los que de verdad aparecen** en esa
+    respuesta, con la instrucción de traducir solo lo evidente y decirlo
+    cuando no lo sea.
+  - **Instrucciones a nivel de servidor** (`instructions=` en `MCPServer`):
+    viajan con el conector, así que valen para cualquiera que lo use sin que
+    tenga que configurar nada en su propio Claude — que es justo lo que hace
+    falta si lo van a usar deportistas del club. Dicen: habla en español y
+    para un deportista, traduce los códigos evidentes, no inventes los
+    opacos, y mira `advertencias` antes de responder porque un dato ausente
+    no es un dato malo.
   - **Fallos parciales (`advertencias`)**: cada tool de lectura agrupa varias
     llamadas a Garmin, y que una falle es lo normal, no lo excepcional — basta
     con que el reloj no se haya sincronizado hoy. `_reunir` lanza el grupo con
