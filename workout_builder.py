@@ -403,6 +403,43 @@ async def delete_workouts(client: Garmin, workout_ids: list[int]) -> dict[str, A
     return {"deleted_count": len(deleted), "deleted_ids": deleted, "failed_ids": failed}
 
 
+async def schedule_workout(client: Garmin, workout_id: int, fecha: str) -> dict[str, Any]:
+    """Agenda la plantilla en esa fecha y avisa si ya había algo puesto ese
+    día. Avisa, no bloquea: repetir la misma sesión dos veces en un día es
+    raro pero legítimo (dos entrenos, mañana y tarde), así que la decisión es
+    de quien entrena. Lo que no puede pasar es que se duplique en silencio.
+
+    El aviso sale de la propia herramienta y no de acordarse de llamar a
+    plan() antes: una salvaguarda que depende de que el que llama se acuerde
+    no es una salvaguarda."""
+    ya_agendado = await training_data.find_scheduled_in_range(client, fecha, fecha)
+    resultado = await asyncio.to_thread(client.schedule_workout, workout_id, fecha)
+
+    # schedule_workout llama al id workoutScheduleId; en el calendario es
+    # "id". Se normaliza al mismo nombre que usa plan().
+    salida: dict[str, Any] = {
+        "scheduled_workout_id": resultado.get("workoutScheduleId"),
+        "workout_id": workout_id,
+        "fecha": fecha,
+        "advertencias": [],
+    }
+    if ya_agendado:
+        titulos = [a.get("title") for a in ya_agendado]
+        mismo = [a for a in ya_agendado if (resultado.get("workout", {}) or {}).get("workoutName") == a.get("title")]
+        salida["advertencias"].append(
+            {
+                "dato": "conflicto_de_calendario",
+                "motivo": (
+                    f"El {fecha} ya tenía {len(ya_agendado)} entreno(s) agendado(s): {titulos}."
+                    + (" Uno es esta misma plantilla, así que puede ser un duplicado." if mismo else "")
+                    + " Se ha agendado igualmente; díselo al usuario y desagenda lo que sobre si no era la intención."
+                ),
+                "ya_agendado": ya_agendado,
+            }
+        )
+    return salida
+
+
 async def candidatas_por_origen(client: Garmin, source: str) -> dict[str, Any]:
     """Enseña qué plantillas tienen ese origen, SIN borrar nada. Primer paso
     obligatorio del borrado en bloque: quien aprueba la acción tiene que ver

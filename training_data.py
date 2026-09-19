@@ -721,6 +721,32 @@ async def carga(client: Garmin, inicio: str, fin: str) -> dict[str, Any]:
     }
 
 
+class ActividadAjenaError(RuntimeError):
+    """La actividad existe, pero es de otra persona."""
+
+
+def _comprobar_que_es_suya(client: Garmin, activity: dict[str, Any], activity_id: int) -> None:
+    """Garmin sirve por id las actividades públicas de CUALQUIER usuario: pedir
+    un id inventado no da 404, devuelve la actividad de un desconocido con
+    toda normalidad (comprobado: el id 999999999 devuelve un ciclismo en
+    Clapham de otra cuenta). Sin esta comprobación, `sesion()` presentaría esa
+    sesión como si fuera del deportista y el análisis saldría sobre datos de
+    otra persona — un error que no falla, solo miente, y encima expone datos
+    ajenos.
+
+    Se compara contra el display_name que el propio cliente ya trae cargado,
+    así que no cuesta ninguna llamada extra."""
+    yo = getattr(client, "display_name", None)
+    duenio = ((activity.get("metadataDTO") or {}).get("userInfoDto") or {}).get("displayname")
+    if yo and duenio and yo != duenio:
+        raise ActividadAjenaError(
+            f"La actividad {activity_id} existe pero es de otra cuenta de Garmin, no de la tuya. "
+            "Garmin sirve por id las actividades públicas de cualquiera, así que un id equivocado "
+            "puede devolver la sesión de un desconocido en vez de un error. Usa un activity_id "
+            "salido de estado(), carga() o plan()."
+        )
+
+
 async def sesion(
     client: Garmin, activity_id: int, detalle: bool = False, potencia_por_zona: bool = False
 ) -> dict[str, Any]:
@@ -737,6 +763,7 @@ async def sesion(
     Incluye el material usado y sus kilómetros acumulados (`gear_stats`),
     para poder cruzar una molestia con unas zapatillas gastadas."""
     activity = await asyncio.to_thread(client.get_activity, str(activity_id))
+    _comprobar_que_es_suya(client, activity, activity_id)
     sport = ((activity.get("activityTypeDTO") or {}).get("typeKey") or "").lower()
 
     calls: dict[str, Any] = {

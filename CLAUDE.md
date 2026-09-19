@@ -231,6 +231,32 @@ pip install -r requirements.txt  # instalar/actualizar dependencias
     de proceso (no por deportista, que es lo mismo para todos) — no al
     arrancar, como pedía el spec, porque pedirlo exige una sesión de Garmin
     autenticada y al arrancar todavía no hay ninguna.
+  - **Una actividad por id puede no ser tuya**: Garmin sirve por id las
+    actividades **públicas de cualquier usuario**. Pedir un id inventado no da
+    404 — devuelve la sesión de un desconocido con toda normalidad
+    (comprobado: el id 999999999 devuelve un ciclismo en Clapham de otra
+    cuenta). Sin comprobarlo, `sesion()` la presentaba como del deportista y
+    el análisis salía sobre datos ajenos, sin ninguna advertencia.
+    `_comprobar_que_es_suya` compara el dueño de la actividad con el
+    `display_name` que el cliente ya trae cargado, así que no cuesta ninguna
+    llamada extra. Si Garmin no manda dueño, no se bloquea: no se puede
+    afirmar que sea ajena, y rechazar una sesión legítima por un campo que
+    falta sería peor.
+  - **Errores legibles para el modelo** (`errores_claros` en `mcp_server.py`):
+    el SDK solo deja pasar al cliente el texto de un `ToolError`; cualquier
+    otra excepción se convierte en "Error executing tool <nombre>" y el motivo
+    se queda en el log. Eso hacía que un id inventado, un 429 de Garmin y un
+    corte de red dieran el mismo mensaje inútil, sin forma de saber si
+    reintentar, corregir el id o reconectar. El decorador traduce lo
+    previsible —404, 429, sesión caducada, corte de red, y las validaciones
+    propias (`ValueError`)— y **deja subir lo inesperado**: disfrazar un bug
+    de mensaje amable lo escondería.
+  - **`agendar` avisa de conflicto**: si ese día ya había algo, lo agenda
+    igual pero lo dice en `advertencias`, señalando si además es la misma
+    plantilla (probable duplicado). No bloquea —dos sesiones en un día son
+    legítimas— pero el aviso sale de la propia tool y no de acordarse de
+    llamar a `plan()` antes: una salvaguarda que depende de que el que llama
+    se acuerde no es una salvaguarda.
   - **Fallos parciales (`advertencias`)**: cada tool de lectura agrupa varias
     llamadas a Garmin, y que una falle es lo normal, no lo excepcional — basta
     con que el reloj no se haya sincronizado hoy. `_reunir` lanza el grupo con

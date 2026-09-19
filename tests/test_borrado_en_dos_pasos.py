@@ -10,6 +10,8 @@ que puede ser 3 plantillas o 38 sin que se vea en el diálogo.
 
 import pytest
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 import mcp_server
 import training_data
 import workout_builder
@@ -92,7 +94,10 @@ async def test_desagendar_por_ids_si_desagenda(garmin):
     ],
 )
 async def test_borrar_exige_un_modo_u_otro(garmin, kwargs):
-    with pytest.raises(ValueError):
+    # ToolError y no ValueError: el decorador `errores_claros` las traduce
+    # para que el texto llegue al modelo. Con un ValueError pelado el SDK
+    # responde "Error executing tool borrar_entreno" y se pierde el motivo.
+    with pytest.raises(ToolError, match="workout_ids O source"):
         await mcp_server.borrar_entreno(**kwargs)
     assert garmin.borrados == []
 
@@ -100,6 +105,6 @@ async def test_borrar_exige_un_modo_u_otro(garmin, kwargs):
 async def test_el_filtro_no_alcanza_las_plantillas_propias(garmin):
     """Las creadas a mano tienen source=None, y el modo por origen exige un
     valor concreto: no hay forma de barrerlas con un filtro."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         await mcp_server.borrar_entreno(source=None)
     assert garmin.borrados == []

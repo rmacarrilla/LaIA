@@ -5,10 +5,19 @@ mcp.server.auth.middleware.auth_context.get_access_token() da el AccessToken de
 la petición en curso, cuyo `subject` es el id de ese usuario en Postgres."""
 
 import asyncio
+import functools
 import html
 import os
+from collections.abc import Callable, Coroutine
+from typing import Any, TypeVar
 
 from dotenv import load_dotenv
+from garminconnect import (
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.auth.middleware.auth_context import get_access_token
 from pydantic import AnyHttpUrl
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -63,7 +72,69 @@ async def _client_for_current_user() -> garmin_client.Garmin:
     return await asyncio.to_thread(garmin_client.client_from_session_cached, user_id, session_blob)
 
 
+_T = TypeVar("_T")
+
+# Garmin no tiene una excepción para "esa actividad no es tuya": responde 404
+# igual que si no existiera, así que el mensaje no puede prometer distinguirlas.
+_ERRORES_GARMIN: list[tuple[type[Exception] | tuple[type[Exception], ...], str]] = [
+    (
+        GarminConnectTooManyRequestsError,
+        "Garmin está limitando las peticiones de esta cuenta (429). Espera unos minutos antes de volver a intentarlo; no es un fallo del conector.",
+    ),
+    (
+        GarminConnectAuthenticationError,
+        "La sesión guardada de Garmin ya no vale. Vuelve a conectar el conector para autorizarlo de nuevo.",
+    ),
+    (
+        GarminConnectConnectionError,
+        "No se pudo contactar con Garmin. Puede ser un corte temporal de su API: reintenta en un momento.",
+    ),
+]
+
+
+def errores_claros(
+    fn: Callable[..., Coroutine[Any, Any, _T]],
+) -> Callable[..., Coroutine[Any, Any, _T]]:
+    """Traduce los fallos previsibles a un mensaje que el modelo pueda leer.
+
+    El SDK solo deja pasar al cliente el texto de un `ToolError`; cualquier
+    otra excepción se convierte en un escueto "Error executing tool <nombre>"
+    y el motivo se queda en el log del servidor. Eso convertía un id
+    inventado, un 429 de Garmin y un corte de red en el mismo mensaje inútil,
+    sin forma de saber si reintentar, corregir el id o reconectar.
+
+    `ValueError` incluido a propósito: son las validaciones de las propias
+    tools (modos mutuamente excluyentes, rangos de más de 120 días), y decirle
+    al modelo qué hizo mal es justo lo que le permite corregirlo solo."""
+
+    @functools.wraps(fn)
+    async def envoltorio(*args: Any, **kwargs: Any) -> _T:
+        try:
+            return await fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except training_data.ActividadAjenaError as err:
+            raise ToolError(str(err)) from err
+        except ValueError as err:
+            raise ToolError(str(err)) from err
+        except Exception as err:
+            nombre = type(err).__name__
+            if nombre == "GarminConnectNotFoundError" or "404" in str(err):
+                raise ToolError(
+                    "Garmin no encuentra ese id. Comprueba que sea uno devuelto por estado(), "
+                    "carga() o plan() y no uno inventado — Garmin responde lo mismo si el id no "
+                    "existe que si es de otra cuenta, así que no se puede distinguir."
+                ) from err
+            for tipos, mensaje in _ERRORES_GARMIN:
+                if isinstance(err, tipos):
+                    raise ToolError(mensaje) from err
+            raise
+
+    return envoltorio
+
+
 @mcp.tool()
+@errores_claros
 async def estado(dias: int = 7, spo2_detalle: bool = False) -> dict:
     """Cómo está el deportista hoy y en los últimos `dias` días — primera
     llamada de casi cualquier conversación sobre si puede entrenar fuerte,
@@ -88,6 +159,7 @@ async def estado(dias: int = 7, spo2_detalle: bool = False) -> dict:
 
 
 @mcp.tool()
+@errores_claros
 async def capacidad(extras: list[str] | None = None) -> dict:
     """De qué es capaz el deportista ahora mismo: umbrales, zonas, FTP,
     VO2max, predicciones de carrera. Todo esto cambia en semanas o meses, no
@@ -111,6 +183,7 @@ async def capacidad(extras: list[str] | None = None) -> dict:
 
 
 @mcp.tool()
+@errores_claros
 async def carga(inicio: str, fin: str) -> dict:
     """Qué se ha entrenado en [inicio, fin] (YYYY-MM-DD): volumen por
     disciplina, reparto de intensidad, progresión semanal. La llamada de la
@@ -122,6 +195,7 @@ async def carga(inicio: str, fin: str) -> dict:
 
 
 @mcp.tool()
+@errores_claros
 async def sesion(activity_id: int, detalle: bool = False, potencia_por_zona: bool = False) -> dict:
     """Qué pasó en una sesión concreta. Nunca se llama sin un activity_id ya
     obtenido antes de estado() o de plan() — esta tool no busca actividades,
@@ -140,6 +214,7 @@ async def sesion(activity_id: int, detalle: bool = False, potencia_por_zona: boo
 
 
 @mcp.tool()
+@errores_claros
 async def plan(inicio: str, fin: str, workout_id: int | None = None) -> dict:
     """Qué hay agendado en [inicio, fin] (YYYY-MM-DD) y con qué construirlo —
     junta el calendario y la biblioteca de plantillas, para no crear una
@@ -157,6 +232,7 @@ async def plan(inicio: str, fin: str, workout_id: int | None = None) -> dict:
 
 
 @mcp.tool()
+@errores_claros
 async def crear_entreno(sport: str, name: str, steps: list[dict], agendar_fecha: str | None = None) -> dict:
     """Crea (sube a la librería de entrenamientos de Garmin) un entrenamiento
     estructurado por intervalos. Con `agendar_fecha` (YYYY-MM-DD) lo deja
@@ -204,6 +280,7 @@ async def crear_entreno(sport: str, name: str, steps: list[dict], agendar_fecha:
 
 
 @mcp.tool()
+@errores_claros
 async def modificar_entreno(
     workout_id: int,
     sport: str | None = None,
@@ -252,18 +329,25 @@ async def modificar_entreno(
 
 
 @mcp.tool()
+@errores_claros
 async def agendar(workout_id: int, date: str) -> dict:
     """Agenda en el calendario de Garmin, en la fecha dada (YYYY-MM-DD), un
     entrenamiento ya creado con crear_entreno. Se puede llamar varias veces
     con el mismo workout_id para repetir la misma sesión en distintas fechas.
-    Llama antes a plan() para comprobar que la fecha está libre. Tras escribir, lo que devolvió plan() para esa fecha queda
+
+    Si ese día ya tenía algo agendado, lo agenda igual pero lo dice en
+    `advertencias`, señalando si además es la misma plantilla (probable
+    duplicado). No bloquea: dos sesiones en un día son legítimas y la
+    decisión es del deportista. Pero no hace falta llamar a plan() antes solo
+    para comprobarlo — si hay conflicto, esta tool te lo dice. Tras escribir, lo que devolvió plan() para esa fecha queda
     desactualizado: vuelve a llamarlo antes del siguiente cambio en el
     mismo rango."""
     client = await _client_for_current_user()
-    return await asyncio.to_thread(client.schedule_workout, workout_id, date)
+    return await workout_builder.schedule_workout(client, workout_id, date)
 
 
 @mcp.tool()
+@errores_claros
 async def desagendar(
     scheduled_workout_ids: list[int] | None = None,
     start_date: str | None = None,
@@ -308,6 +392,7 @@ async def desagendar(
 
 
 @mcp.tool()
+@errores_claros
 async def borrar_entreno(workout_ids: list[int] | None = None, source: str | None = None) -> dict:
     """Borra de verdad una o varias plantillas de la librería de Garmin — a
     diferencia de desagendar, que solo quita la entrada del calendario, esto
